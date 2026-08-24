@@ -72,14 +72,30 @@ class VoiceEngine(
         onPartial(extract(hypothesis, "partial"))
     }
 
+    // ---- final-result dedupe ----
+    // One utterance can surface through BOTH onResult (continuous decode) and
+    // onFinalResult (fired when recognition pauses/stops) — without dedupe a
+    // single spoken command reaches onFinal twice and POSTs twice. Suppress an
+    // identical final arriving within the dedupe window; a genuinely repeated
+    // command more than 2s later still goes through.
+    private var lastFinalText = ""
+    private var lastFinalAtMs = 0L
+
+    private fun deliverFinal(text: String) {
+        if (text.isBlank()) return
+        val now = System.currentTimeMillis()
+        if (text == lastFinalText && now - lastFinalAtMs < DEDUPE_WINDOW_MS) return
+        lastFinalText = text
+        lastFinalAtMs = now
+        onFinal(text)
+    }
+
     override fun onResult(hypothesis: String?) {
-        val text = extract(hypothesis, "text")
-        if (text.isNotBlank()) onFinal(text)
+        deliverFinal(extract(hypothesis, "text"))
     }
 
     override fun onFinalResult(hypothesis: String?) {
-        val text = extract(hypothesis, "text")
-        if (text.isNotBlank()) onFinal(text)
+        deliverFinal(extract(hypothesis, "text"))
     }
 
     override fun onError(exception: Exception?) {
@@ -88,5 +104,9 @@ class VoiceEngine(
 
     override fun onTimeout() {
         onErr("voice timeout")
+    }
+
+    private companion object {
+        const val DEDUPE_WINDOW_MS = 2_000L
     }
 }
