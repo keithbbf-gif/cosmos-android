@@ -645,8 +645,9 @@ class MainActivity : ComponentActivity() {
         }
 
         if (state.drivingMode.value) {
-            // Junk gate: road noise / one-word fragments that are not a COSMOS
-            // verb are dropped entirely — never sent, never spoken about.
+            // Junk gate: road noise, filler words ("huh", "uh huh"), and
+            // fragments with no real content and no COSMOS verb are dropped
+            // entirely — never sent, never spoken about.
             if (VoiceGrammar.isJunk(norm)) {
                 log("(ignored as noise: \"$raw\")")
                 return
@@ -694,7 +695,7 @@ class MainActivity : ComponentActivity() {
                 val resp = CosmosClient.postVoice(base, state.token.value.trim(), body)
                 withContext(Dispatchers.Main) {
                     onServerReachable(true)
-                    handleReply(transcript, resp, quiet)
+                    handleReply(transcript, resp)
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -761,8 +762,9 @@ class MainActivity : ComponentActivity() {
                         state.queueSize.value = queue.size
                         log("FLUSHED: \"$item\"")
                         // add=true: flushed replies queue up behind each other
-                        // instead of each one cutting off the last.
-                        handleReply(item, resp, quiet = false, add = true)
+                        // instead of each one cutting off the last. Flushed
+                        // dictation stays silent (server `kind` rule applies).
+                        handleReply(item, resp, add = true)
                     }
                 }
             } catch (e: Exception) {
@@ -778,7 +780,6 @@ class MainActivity : ComponentActivity() {
     private fun handleReply(
         original: String,
         o: JSONObject,
-        quiet: Boolean = false,
         add: Boolean = false
     ) {
         // Carry the session forward — the sid IS the conversation.
@@ -821,21 +822,18 @@ class MainActivity : ComponentActivity() {
         }
 
         // ==================== SPOKEN MODERATION ====================
-        // Decided by the SERVER's `kind`, never by a client-side verb guess
-        // (the old startsWithKnownVerb guess mis-fired on Vosk output and
-        // suppressed real command replies to "Noted."). Rules:
-        //  - LIVE utterance, driving mode: only kind == "dictation" (and not
-        //    refused) is quieted to "Noted." — genuine ambient speech.
-        //    command / ask / query / unknown / refused all speak IN FULL.
-        //  - LIVE utterance, non-driving: never quieted (unchanged).
-        //  - FLUSHED queue item (add=true): the caller's `quiet` is honored
-        //    (tryFlush passes false, so flushed replies read out in full,
-        //    exactly as before). The passed-in `quiet` is IGNORED for the
-        //    live path — it is only a pre-send cue hint there (see send()).
-        val quietSpoken = if (add) quiet
-            else state.drivingMode.value && kind == "dictation"
+        // Decided by the SERVER's `kind`, never by a client-side verb guess.
+        // Rule: pure dictation is SILENT. kind == "dictation" (and not
+        // refused) produces NO TTS at all — no "Noted.", no cue — in every
+        // mode (driving, desk, and flushed queue items alike). It is already
+        // logged to the console above, which is the only trace it leaves.
+        // Everything else — command / ask / query / unknown / refused, and
+        // the needs_confirm prompt handled above — speaks IN FULL, as before.
+        if (kind == "dictation" && !refused) {
+            log("(dictation — noted silently, not spoken)")
+            return
+        }
         val toSpeak: String? = when {
-            quietSpoken && !refused -> "Noted."
             spoken.isNotBlank() -> spoken
             state.drivingMode.value && refused -> "COSMOS refused that."
             state.drivingMode.value && o.has("http_status") ->

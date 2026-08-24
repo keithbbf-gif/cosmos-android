@@ -23,6 +23,17 @@ object VoiceGrammar {
         "help", "submit", "session", "search", "open", "ask"
     )
 
+    /** Filler/noise tokens Vosk hallucinates out of ambient sound. Used ONLY
+     *  by the junk DROP gate: they carry no content, so an utterance made
+     *  entirely of them (or of them plus one non-verb word) never leaves the
+     *  phone. NOT consulted by isYes — a lone "yeah"/"okay" while a confirm
+     *  is pending is still a valid answer (that path runs before the gate). */
+    private val FILLERS = setOf(
+        "huh", "uh", "uhh", "um", "umm", "hmm", "hm", "mm", "mmm", "mhm",
+        "mhmm", "yeah", "yep", "ok", "okay", "oh", "ohh", "ah", "ahh", "eh",
+        "er", "the", "a", "an", "and"
+    )
+
     private val YES_WORDS = setOf(
         "yes", "yeah", "yep", "yup", "confirm", "affirmative", "sure",
         "ok", "okay", "correct"
@@ -73,15 +84,26 @@ object VoiceGrammar {
         return null
     }
 
-    /** Junk gate: fragments that are almost certainly road noise / side chatter.
-     *  Very short, or a single word that is not a COSMOS verb. */
+    /** Junk gate: fragments that are almost certainly road noise / side
+     *  chatter. Dropped (never sent):
+     *   - empty, or shorter than 3 characters after normalize ("", "ok", "mm")
+     *   - utterances made entirely of filler tokens ("huh", "uh huh", "yeah okay")
+     *   - a single real (non-filler) word that is not a COSMOS verb ("chess",
+     *     "huh chess") — one content word is a fragment, not dictation
+     *  Kept (sent to COSMOS, which classifies it):
+     *   - anything whose first token is a known verb ("status", "ask ...")
+     *   - anything with 2+ real words — genuine dictation or an ask. */
     fun isJunk(norm: String): Boolean {
         // Re-normalize defensively (idempotent) so casing/whitespace from the
         // recognizer can never matter, even if a caller passes raw text.
         val n = stripWake(normalize(norm))
         if (n.length < 3) return true
         val t = tokens(n)
-        return t.size == 1 && t[0] !in VERBS
+        if (t.firstOrNull() in VERBS) return false // command shape — always keep
+        val real = t.filterNot { it in FILLERS }   // strip filler/noise tokens
+        if (real.isEmpty()) return true            // pure filler
+        if (real.size == 1 && real[0] !in VERBS) return true // lone fragment
+        return false                               // 2+ real words: keep
     }
 
     /** Does the utterance start with a known COSMOS verb (after optional wake
