@@ -58,4 +58,17 @@ dependencies {
     // VOSK on-device speech recognition (offline). JNA is required by vosk-android.
     implementation("net.java.dev.jna:jna:5.13.0@aar")
     implementation("com.alphacephei:vosk-android:0.3.47")
+
+    // sherpa-onnx on-device text-to-speech (offline, Piper VITS voice) — the
+    // speech-OUT twin of Vosk. The AAR bundles the native .so libs for all four
+    // ABIs (arm64-v8a, armeabi-v7a, x86, x86_64); no NDK config needed. This is
+    // the official k2-fsa release AAR served via JitPack (see settings.gradle.kts);
+    // depend on this exact sub-module coordinate ONLY — the aggregator
+    // com.github.k2-fsa:sherpa-onnx also drags in sherpa-onnx-jvm, which
+    // duplicates every class in the AAR and breaks the dex merge.
+    // APK grows ~50 MB from the native libs — accepted.
+    implementation("com.github.k2-fsa.sherpa-onnx:sherpa-onnx:1.13.6")
+
+    // tar.bz2 extraction for the Piper voice archive (pure Java, no natives).
+    implementation("org.apache.commons:commons-compress:1.27.1")
 }

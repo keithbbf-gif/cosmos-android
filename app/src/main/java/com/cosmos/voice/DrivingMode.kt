@@ -9,13 +9,15 @@ import java.util.Locale
  *
  * The SERVER classifies commands — this object only decides what the PHONE
  * does locally: driving-mode toggles, yes/no answers to a pending confirm,
- * junk gating (road noise), and whether a reply deserves a full spoken
- * response or a brief "noted".
+ * and junk gating (road noise). Spoken-reply moderation is NOT decided here:
+ * it comes from the server's `kind` classification (see handleReply).
  */
 object VoiceGrammar {
 
-    /** First words the COSMOS server treats as verbs (moderates what gets SPOKEN,
-     *  never what gets SENT — non-verb speech still goes up as dictation). */
+    /** First words the COSMOS server treats as verbs. Used only for the junk
+     *  DROP gate and the pre-send cue hint — never to moderate what the
+     *  reply SPEAKS (the server's `kind` decides that), and never what gets
+     *  SENT (non-verb speech still goes up as dictation). */
     private val VERBS = setOf(
         "status", "health", "jobs", "spend", "rails", "makers", "events",
         "help", "submit", "session", "search", "open", "ask"
@@ -74,15 +76,18 @@ object VoiceGrammar {
     /** Junk gate: fragments that are almost certainly road noise / side chatter.
      *  Very short, or a single word that is not a COSMOS verb. */
     fun isJunk(norm: String): Boolean {
-        val n = stripWake(norm)
+        // Re-normalize defensively (idempotent) so casing/whitespace from the
+        // recognizer can never matter, even if a caller passes raw text.
+        val n = stripWake(normalize(norm))
         if (n.length < 3) return true
         val t = tokens(n)
         return t.size == 1 && t[0] !in VERBS
     }
 
-    /** Does the utterance start with a known COSMOS verb (after optional wake word)? */
+    /** Does the utterance start with a known COSMOS verb (after optional wake
+     *  word)? Cue-hint only — never used to moderate the spoken reply. */
     fun startsWithKnownVerb(norm: String): Boolean =
-        tokens(stripWake(norm)).firstOrNull() in VERBS
+        tokens(stripWake(normalize(norm))).firstOrNull() in VERBS
 }
 
 /**

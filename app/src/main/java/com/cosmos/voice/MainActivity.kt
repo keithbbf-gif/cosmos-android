@@ -61,6 +61,7 @@ class AppState {
     val connStatus = mutableStateOf("not connected")
     val modelStatus = mutableStateOf("checking")
     val modelProgress = mutableStateOf(0)
+    val ttsStatus = mutableStateOf("checking")
     val listening = mutableStateOf(false)
     val partial = mutableStateOf("")
     val sessionId = mutableStateOf<String?>(null)
@@ -78,7 +79,16 @@ class AppState {
 class MainActivity : ComponentActivity() {
 
     private val state = AppState()
+
+    // Speech OUT. DEFAULT = sherpaTts, the bundled sherpa-onnx offline engine
+    // (Piper VITS voice) — speaks with ZERO device-TTS/Google dependency, so a
+    // stripped phone still talks. `tts` (android.speech.tts) is an OPTIONAL
+    // fallback used only while the bundled voice is downloading/loading, and
+    // only if a device engine actually exists (systemTtsOk).
+    private var sherpaTts: TtsEngine? = null
     private var tts: TextToSpeech? = null
+    @Volatile private var systemTtsOk = false
+
     private var voice: VoiceEngine? = null
 
     // Offline queue: transcripts that failed to POST, flushed when signal returns.
@@ -115,8 +125,11 @@ class MainActivity : ComponentActivity() {
         queue = OfflineQueue(prefs)
         state.queueSize.value = queue.size
 
+        // Optional fallback engine only — absent on a stripped phone, and that
+        // is fine: the bundled sherpa-onnx voice (prepareTtsVoice) is the default.
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
+                systemTtsOk = true
                 tts?.language = Locale.US
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
@@ -143,6 +156,7 @@ class MainActivity : ComponentActivity() {
         }
 
         registerNetworkMonitor()
+        prepareTtsVoice()
 
         state.modelStatus.value = if (ModelManager.isReady(this)) "ready (not loaded)" else "not downloaded"
 
@@ -173,12 +187,62 @@ class MainActivity : ComponentActivity() {
             }
         }
         voice?.stop()
+        sherpaTts?.shutdown()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
     }
 
     // ---------- speech output ----------
+
+    /**
+     * Download (first run, ~20 MB, with progress) then load the bundled
+     * sherpa-onnx Piper voice. Speaking is gated on this: until ready, the
+     * device engine fills in IF one exists; otherwise utterances are dropped
+     * with a log (the text still lands in the console either way).
+     */
+    private fun prepareTtsVoice() {
+        state.ttsStatus.value =
+            if (TtsModelManager.isReady(this)) "loading..." else "preparing voice..."
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                if (!TtsModelManager.isReady(this@MainActivity)) {
+                    withContext(Dispatchers.Main) {
+                        log("Preparing voice (~20 MB download, one time). Needs any internet connection once.")
+                    }
+                    TtsModelManager.download(this@MainActivity) { pct, phase ->
+                        runOnUiThread { state.ttsStatus.value = "$phase $pct%" }
+                    }
+                }
+                val engine = TtsEngine(
+                    // Same contract the android.speech.tts listener had: the
+                    // flags drive the confirm echo-guard, and onDone kicks the
+                    // driving-mode mic back on after we finish talking.
+                    onStart = { _ -> ttsSpeaking = true },
+                    onDone = { _ ->
+                        ttsSpeaking = false
+                        currentUtteranceKind = ""
+                        if (state.drivingMode.value) restartMicIfNeeded()
+                    }
+                )
+                engine.init(this@MainActivity)
+                withContext(Dispatchers.Main) {
+                    sherpaTts = engine
+                    state.ttsStatus.value = "ready (offline)"
+                    log("Offline voice ready (sherpa-onnx, Piper amy). No device TTS engine needed.")
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    state.ttsStatus.value = "error: ${e.message?.take(80)}"
+                    log(
+                        "VOICE PREPARE FAILED: ${e.message} — will retry next launch." +
+                            if (systemTtsOk) " Using the device TTS engine meanwhile."
+                            else " No device TTS engine either; replies are text-only."
+                    )
+                }
+            }
+        }
+    }
 
     /**
      * Speak through TTS. kind:
@@ -189,19 +253,45 @@ class MainActivity : ComponentActivity() {
      *              current speech instead of clobbering it
      * add=true queues behind current speech regardless of kind (used when
      * flushing the offline queue so results read out in order).
+     *
+     * DEFAULT engine: the bundled sherpa-onnx voice (offline, no device engine
+     * needed). android.speech.tts is only the stand-in while the voice model
+     * is still downloading, and only when the device actually has an engine.
      */
     private fun speak(text: String, kind: String = "reply", add: Boolean = false) {
-        val t = tts ?: return
-        val mode = if (add || kind == "cue") TextToSpeech.QUEUE_ADD else TextToSpeech.QUEUE_FLUSH
-        currentUtteranceKind = kind
-        ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
-        val r = t.speak(text, mode, null, "$kind-${System.currentTimeMillis()}")
-        if (r != TextToSpeech.SUCCESS) {
-            // Engine rejected it: clear the flags immediately, otherwise the
-            // confirm echo-guard would ignore finals forever (onDone never fires).
-            ttsSpeaking = false
-            currentUtteranceKind = ""
+        val flush = !(add || kind == "cue") // reply/confirm interrupt; cue/add queue behind
+
+        val engine = sherpaTts
+        if (engine != null && engine.isReady) {
+            currentUtteranceKind = kind
+            ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
+            engine.speak(text, "$kind-${System.currentTimeMillis()}", flush)
+            return
         }
+
+        val t = tts
+        if (t != null && systemTtsOk) {
+            val mode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            currentUtteranceKind = kind
+            ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
+            val r = t.speak(text, mode, null, "$kind-${System.currentTimeMillis()}")
+            if (r != TextToSpeech.SUCCESS) {
+                // Engine rejected it: clear the flags immediately, otherwise the
+                // confirm echo-guard would ignore finals forever (onDone never fires).
+                ttsSpeaking = false
+                currentUtteranceKind = ""
+            }
+            return
+        }
+
+        log("(voice not ready — not spoken: \"${text.take(60)}\")")
+    }
+
+    /** Stop whichever engine is talking (barge-in). The caller clears the
+     *  speaking flags itself, mirroring the old bare tts.stop() path. */
+    private fun stopSpeaking() {
+        sherpaTts?.stop()
+        tts?.stop()
     }
 
     /** Short spoken status cue — driving mode only (silent at the desk). */
@@ -389,7 +479,7 @@ class MainActivity : ComponentActivity() {
                             // the prompt off on our own echo (then treating
                             // that echo as a "no") would cancel real actions.
                             if (p.isNotBlank() && ttsSpeaking && currentUtteranceKind != "confirm") {
-                                tts?.stop()
+                                stopSpeaking()
                                 ttsSpeaking = false
                                 currentUtteranceKind = ""
                             }
@@ -561,12 +651,14 @@ class MainActivity : ComponentActivity() {
                 log("(ignored as noise: \"$raw\")")
                 return
             }
-            // Non-verb speech still goes to COSMOS as dictation (the server
-            // records and classifies it), but the spoken reply is moderated to
-            // a brief "Noted." so ambient conversation never triggers a
-            // monologue at 70 mph.
-            val quiet = !VoiceGrammar.startsWithKnownVerb(norm)
-            send(raw, null, quiet)
+            // Everything else goes to COSMOS — the SERVER classifies it and
+            // returns `kind`; the SPOKEN reply is moderated in handleReply
+            // from that classification, never from a client-side verb guess
+            // (the guess mis-fired on Vosk output and suppressed real command
+            // replies to "Noted."). The verb guess survives only as a
+            // best-effort hint that skips the pre-send "Got it, thinking."
+            // cue for probable ambient speech.
+            send(raw, null, quiet = !VoiceGrammar.startsWithKnownVerb(norm))
         } else {
             send(raw, null, quiet = false)
         }
@@ -574,6 +666,16 @@ class MainActivity : ComponentActivity() {
 
     // ---------- COSMOS API ----------
 
+    /**
+     * POST a transcript to COSMOS.
+     *
+     * `quiet` is a best-effort CLIENT hint ("this is probably ambient speech")
+     * and does exactly one thing: it suppresses the pre-send "Got it,
+     * thinking." cue in driving mode. It does NOT moderate the spoken reply —
+     * that decision is made in handleReply from the SERVER's `kind`
+     * classification, because the client guess (Vosk casing/tokenization) has
+     * wrongly quieted real commands before.
+     */
     private fun send(transcript: String, confirmId: String?, quiet: Boolean = false) {
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
@@ -683,6 +785,9 @@ class MainActivity : ComponentActivity() {
         o.optString("session_id").takeIf { it.isNotBlank() }?.let { state.sessionId.value = it }
 
         val spoken = o.optString("spoken")
+        // The SERVER's classification of this utterance:
+        // "command" | "ask" | "query" | "dictation" | "" (absent/unknown).
+        val kind = o.optString("kind")
         val refused = o.optBoolean("refused", false) ||
             (o.has("ok") && !o.optBoolean("ok", false))
 
@@ -715,11 +820,22 @@ class MainActivity : ComponentActivity() {
             log("[http ${o.optInt("http_status")}]")
         }
 
-        // What gets SPOKEN. Driving mode speaks EVERYTHING (refusals and
-        // errors included); quiet dictation gets a brief "Noted." — unless it
-        // was refused, in which case the refusal is spoken in full.
+        // ==================== SPOKEN MODERATION ====================
+        // Decided by the SERVER's `kind`, never by a client-side verb guess
+        // (the old startsWithKnownVerb guess mis-fired on Vosk output and
+        // suppressed real command replies to "Noted."). Rules:
+        //  - LIVE utterance, driving mode: only kind == "dictation" (and not
+        //    refused) is quieted to "Noted." — genuine ambient speech.
+        //    command / ask / query / unknown / refused all speak IN FULL.
+        //  - LIVE utterance, non-driving: never quieted (unchanged).
+        //  - FLUSHED queue item (add=true): the caller's `quiet` is honored
+        //    (tryFlush passes false, so flushed replies read out in full,
+        //    exactly as before). The passed-in `quiet` is IGNORED for the
+        //    live path — it is only a pre-send cue hint there (see send()).
+        val quietSpoken = if (add) quiet
+            else state.drivingMode.value && kind == "dictation"
         val toSpeak: String? = when {
-            quiet && !refused -> "Noted."
+            quietSpoken && !refused -> "Noted."
             spoken.isNotBlank() -> spoken
             state.drivingMode.value && refused -> "COSMOS refused that."
             state.drivingMode.value && o.has("http_status") ->
@@ -785,6 +901,7 @@ fun AppScreen(
             )
             Text(
                 text = "voice model: ${state.modelStatus.value}" +
+                    "  ·  voice out: ${state.ttsStatus.value}" +
                     (state.sessionId.value?.let { "  ·  session ${it.take(8)}" } ?: ""),
                 style = MaterialTheme.typography.bodySmall
             )
