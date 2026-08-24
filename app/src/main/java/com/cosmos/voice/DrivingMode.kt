@@ -113,35 +113,65 @@ object VoiceGrammar {
 }
 
 /**
- * FIFO of transcripts that failed to POST (no signal on the road).
+ * FIFO of /voice requests that failed to POST (no signal on the road).
+ *
+ * Each item is the FULL request body as a JSON string — transcript,
+ * request_id (idempotency key, generated at the FIRST attempt so the flush
+ * re-sends the SAME id and the server can dedupe), and session_id — so a
+ * flush replays the original request, not a reconstruction. Legacy items
+ * that are bare transcripts (pre-request_id builds) are still accepted by
+ * the flusher.
  *
  * In-memory list mirrored to SharedPreferences as a JSON array on every
  * mutation, so queued commands survive an app restart. A command is only
  * removed AFTER its re-POST succeeds — a flush interrupted by signal loss
  * leaves the remainder queued. Never silently lose a command.
+ *
+ * Bounded at MAX_ITEMS: past the cap the OLDEST item is dropped (a bounded,
+ * reported loss beats an unbounded SharedPreferences string). A corrupt
+ * persisted queue is never silently discarded — the raw string is preserved
+ * under a backup key and the error surfaces via loadError.
  */
 class OfflineQueue(private val prefs: SharedPreferences) {
 
     private val items = mutableListOf<String>()
 
+    /** Non-null when the persisted queue failed to parse at startup. The raw
+     *  string was preserved under KEY_CORRUPT_BACKUP for post-mortem. */
+    var loadError: String? = null
+        private set
+
     init {
+        val raw = prefs.getString(KEY, "[]") ?: "[]"
         try {
-            val arr = JSONArray(prefs.getString(KEY, "[]") ?: "[]")
+            val arr = JSONArray(raw)
             for (i in 0 until arr.length()) {
                 val s = arr.optString(i)
                 if (s.isNotBlank()) items.add(s)
             }
         } catch (e: Exception) {
-            // A corrupt persisted queue is dropped rather than crashing startup.
+            // NEVER silently discard: preserve the corrupt payload for
+            // post-mortem and surface the error to the caller's log.
+            prefs.edit().putString(KEY_CORRUPT_BACKUP, raw).apply()
+            loadError = "offline queue was corrupt — preserved to '$KEY_CORRUPT_BACKUP' " +
+                "(${raw.length} chars): ${e.message}"
         }
     }
 
     val size: Int get() = synchronized(items) { items.size }
 
-    fun add(transcript: String) {
+    /** Add a full request-body JSON string. Returns the number of oldest
+     *  items dropped to stay under the cap (0 normally). */
+    fun add(requestJson: String): Int {
         synchronized(items) {
-            items.add(transcript)
+            items.add(requestJson)
+            var dropped = 0
+            while (items.size > MAX_ITEMS) {
+                items.removeAt(0)
+                dropped++
+            }
             persist()
+            return dropped
         }
     }
 
@@ -161,7 +191,9 @@ class OfflineQueue(private val prefs: SharedPreferences) {
         prefs.edit().putString(KEY, JSONArray(items).toString()).apply()
     }
 
-    private companion object {
-        const val KEY = "offline_queue"
+    companion object {
+        const val MAX_ITEMS = 100
+        private const val KEY = "offline_queue"
+        private const val KEY_CORRUPT_BACKUP = "offline_queue_corrupt_backup"
     }
 }
