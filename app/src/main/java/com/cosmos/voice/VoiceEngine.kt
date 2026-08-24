@@ -28,8 +28,15 @@ class VoiceEngine(
 
     val isLoaded: Boolean get() = model != null
 
-    /** Start continuous listening. Throws IOException if the mic cannot open. */
+    /** True while a SpeechService is live. Used by driving mode's auto-restart
+     *  to tell "still listening" apart from "died silently". */
+    val isRunning: Boolean get() = speechService != null
+
+    /** Start continuous listening. Throws IOException if the mic cannot open.
+     *  Idempotent: a second start() while running is a no-op, so the driving-mode
+     *  auto-restart path can call it defensively. */
     fun start() {
+        if (speechService != null) return
         val m = model ?: throw IllegalStateException("VOSK model not loaded")
         val recognizer = Recognizer(m, 16000.0f)
         val service = SpeechService(recognizer, 16000.0f)
@@ -38,7 +45,17 @@ class VoiceEngine(
     }
 
     fun stop() {
-        speechService?.stop()
+        speechService?.let {
+            it.stop()
+            // Release the AudioRecord too — without this, repeated stop/start
+            // cycles (driving mode restarts after every error) can exhaust
+            // audio inputs and make the next start() fail.
+            try {
+                it.shutdown()
+            } catch (e: Exception) {
+                // best-effort release
+            }
+        }
         speechService = null
     }
 
