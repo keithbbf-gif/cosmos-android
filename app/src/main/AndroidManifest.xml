@@ -5,6 +5,9 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Normal permission (no runtime prompt): connectivity change cues in driving mode. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Normal permission (no runtime prompt): eyes-free haptic cues (mic tick,
+         sent double-tick, reply buzz, confirm/refusal pulses). -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <application
         android:label="COSMOS Voice"

@@ -12,6 +12,13 @@ import android.view.WindowManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -26,11 +33,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Divider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -38,7 +47,10 @@ import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
@@ -74,7 +86,19 @@ class AppState {
     val drivingMode = mutableStateOf(false)
     val netStatus = mutableStateOf("unknown")
     val queueSize = mutableStateOf(0)
+
+    // ---- feedback (visual phase + haptics toggle) ----
+    // Compose-observable mirrors of the @Volatile flags in MainActivity, so the
+    // UI can actually recompose on them. Written on the main thread.
+    val speaking = mutableStateOf(false)   // TTS is audibly talking
+    val thinking = mutableStateOf(false)   // a POST to COSMOS is in flight
+    val hapticsOn = mutableStateOf(true)   // settings toggle, persisted
 }
+
+/** The one visual phase the mic button + big label reflect. Priority when
+ *  several are true at once (driving mode keeps the mic hot): SPEAKING >
+ *  THINKING > LISTENING > IDLE. */
+enum class VoicePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
 class MainActivity : ComponentActivity() {
 
@@ -90,6 +114,9 @@ class MainActivity : ComponentActivity() {
     @Volatile private var systemTtsOk = false
 
     private var voice: VoiceEngine? = null
+
+    // Eyes-free haptic cues (tick / double-tick / buzz / confirm pulses).
+    private lateinit var haptics: Haptics
 
     // Offline queue: transcripts that failed to POST, flushed when signal returns.
     private lateinit var queue: OfflineQueue
@@ -125,6 +152,10 @@ class MainActivity : ComponentActivity() {
         queue = OfflineQueue(prefs)
         state.queueSize.value = queue.size
 
+        state.hapticsOn.value = prefs.getBoolean("haptics_on", true)
+        haptics = Haptics(this)
+        haptics.enabled = state.hapticsOn.value
+
         // Optional fallback engine only — absent on a stripped phone, and that
         // is fine: the bundled sherpa-onnx voice (prepareTtsVoice) is the default.
         tts = TextToSpeech(this) { status ->
@@ -134,6 +165,7 @@ class MainActivity : ComponentActivity() {
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         ttsSpeaking = true
+                        runOnUiThread { state.speaking.value = true }
                     }
 
                     override fun onDone(utteranceId: String?) {
@@ -142,6 +174,7 @@ class MainActivity : ComponentActivity() {
                         // DRIVING: the recognizer must never silently stay dead
                         // after we finish talking — kick it back on if it died.
                         runOnUiThread {
+                            state.speaking.value = false
                             if (state.drivingMode.value) restartMicIfNeeded()
                         }
                     }
@@ -150,6 +183,7 @@ class MainActivity : ComponentActivity() {
                     override fun onError(utteranceId: String?) {
                         ttsSpeaking = false
                         currentUtteranceKind = ""
+                        runOnUiThread { state.speaking.value = false }
                     }
                 })
             }
@@ -168,7 +202,8 @@ class MainActivity : ComponentActivity() {
                     onMic = { toggleMic() },
                     onConfirm = { confirmPending() },
                     onSave = { saveSettings() },
-                    onDriving = { setDrivingMode(!state.drivingMode.value) }
+                    onDriving = { setDrivingMode(!state.drivingMode.value) },
+                    onHaptics = { on -> setHaptics(on) }
                 )
             }
         }
@@ -218,11 +253,17 @@ class MainActivity : ComponentActivity() {
                     // Same contract the android.speech.tts listener had: the
                     // flags drive the confirm echo-guard, and onDone kicks the
                     // driving-mode mic back on after we finish talking.
-                    onStart = { _ -> ttsSpeaking = true },
+                    onStart = { _ ->
+                        ttsSpeaking = true
+                        runOnUiThread { state.speaking.value = true }
+                    },
                     onDone = { _ ->
                         ttsSpeaking = false
                         currentUtteranceKind = ""
-                        if (state.drivingMode.value) restartMicIfNeeded()
+                        runOnUiThread {
+                            state.speaking.value = false
+                            if (state.drivingMode.value) restartMicIfNeeded()
+                        }
                     }
                 )
                 engine.init(this@MainActivity)
@@ -265,6 +306,7 @@ class MainActivity : ComponentActivity() {
         if (engine != null && engine.isReady) {
             currentUtteranceKind = kind
             ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
+            state.speaking.value = true
             engine.speak(text, "$kind-${System.currentTimeMillis()}", flush)
             return
         }
@@ -274,12 +316,14 @@ class MainActivity : ComponentActivity() {
             val mode = if (flush) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
             currentUtteranceKind = kind
             ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
+            state.speaking.value = true
             val r = t.speak(text, mode, null, "$kind-${System.currentTimeMillis()}")
             if (r != TextToSpeech.SUCCESS) {
                 // Engine rejected it: clear the flags immediately, otherwise the
                 // confirm echo-guard would ignore finals forever (onDone never fires).
                 ttsSpeaking = false
                 currentUtteranceKind = ""
+                state.speaking.value = false
             }
             return
         }
@@ -394,6 +438,17 @@ class MainActivity : ComponentActivity() {
             .apply()
     }
 
+    /** Haptics on/off toggle — persisted, default ON. */
+    private fun setHaptics(on: Boolean) {
+        state.hapticsOn.value = on
+        haptics.enabled = on
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putBoolean("haptics_on", on)
+            .apply()
+        if (on) haptics.micStart() // one tick so the switch itself is felt
+        log(if (on) "Haptics ON." else "Haptics OFF.")
+    }
+
     private fun testConnection() {
         saveSettings()
         val base = state.baseUrl.value.trim().trimEnd('/')
@@ -482,6 +537,7 @@ class MainActivity : ComponentActivity() {
                                 stopSpeaking()
                                 ttsSpeaking = false
                                 currentUtteranceKind = ""
+                                state.speaking.value = false
                             }
                         }
                     },
@@ -553,6 +609,7 @@ class MainActivity : ComponentActivity() {
             try {
                 voice?.start()
                 state.listening.value = true
+                haptics.micStart() // short tick: "I'm hearing you" — no glance needed
                 log("Listening... speak, pause to send. Tap again to stop.")
                 cue("Listening.")
             } catch (e: Exception) {
@@ -687,6 +744,8 @@ class MainActivity : ComponentActivity() {
         if (state.drivingMode.value && !quiet && confirmId == null) {
             cue("Got it, thinking.")
         }
+        haptics.sent()             // double-tick: recognized and on its way
+        state.thinking.value = true // THINKING phase until the server answers
         lifecycleScope.launch(Dispatchers.IO) {
             try {
                 val body = JSONObject().put("transcript", transcript)
@@ -694,11 +753,13 @@ class MainActivity : ComponentActivity() {
                 if (confirmId != null) body.put("confirm_id", confirmId)
                 val resp = CosmosClient.postVoice(base, state.token.value.trim(), body)
                 withContext(Dispatchers.Main) {
+                    state.thinking.value = false
                     onServerReachable(true)
                     handleReply(transcript, resp)
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
+                    state.thinking.value = false
                     log("SEND FAILED: ${e.message}")
                     onServerReachable(false)
                     onSendFailed(transcript, confirmId)
@@ -798,6 +859,8 @@ class MainActivity : ComponentActivity() {
             if (cid.isNotBlank()) {
                 state.pendingConfirmId.value = cid
                 state.pendingTranscript.value = original
+                // Two strong pulses: a consequential confirm is FELT, not just heard.
+                haptics.alert()
                 log("NEEDS CONFIRM — say yes/no (or tap CONFIRM). Never auto-run.")
                 // Voice confirm: the driver never has to tap. Spoken with kind
                 // "confirm" -> barge-in disabled + mid-prompt finals ignored
@@ -811,6 +874,10 @@ class MainActivity : ComponentActivity() {
                 return
             }
         }
+
+        // Haptic for the reply itself: refusal gets the strong double-pulse,
+        // everything else a soft "reply arrived" buzz (fires alongside TTS start).
+        if (refused) haptics.alert() else haptics.reply()
 
         val shown = if (spoken.isNotBlank()) spoken else o.toString().take(400)
         log("COSMOS: $shown")
@@ -876,8 +943,21 @@ fun AppScreen(
     onMic: () -> Unit,
     onConfirm: () -> Unit,
     onSave: () -> Unit,
-    onDriving: () -> Unit
+    onDriving: () -> Unit,
+    onHaptics: (Boolean) -> Unit
 ) {
+    // One visual phase drives the mic button, pulse ring, spinner, and the
+    // big glanceable label. Priority: SPEAKING > THINKING > LISTENING > IDLE.
+    val phase = when {
+        state.speaking.value -> VoicePhase.SPEAKING
+        state.thinking.value -> VoicePhase.THINKING
+        state.listening.value -> VoicePhase.LISTENING
+        else -> VoicePhase.IDLE
+    }
+    val listenColor = Color(0xFFB3261E)  // red — listening
+    val thinkColor = Color(0xFFF9A825)   // amber — waiting on the server
+    val speakColor = Color(0xFF1565C0)   // blue — TTS talking
+
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
 
@@ -935,6 +1015,19 @@ fun AppScreen(
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                 )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Text(
+                        text = "Haptic feedback (vibration cues)",
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = state.hapticsOn.value,
+                        onCheckedChange = onHaptics
+                    )
+                }
                 Button(
                     onClick = onConnect,
                     modifier = Modifier.padding(top = 8.dp)
@@ -964,23 +1057,97 @@ fun AppScreen(
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
             )
 
-            // Big mic button (tap to toggle)
-            Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
+            // Big mic button (tap to toggle) — the button IS the status light:
+            //   IDLE      neutral (theme primary)
+            //   LISTENING red + breathing pulse ring
+            //   THINKING  amber + spinner around the button
+            //   SPEAKING  blue + faster pulse ring
+            val micColor = animateColorAsState(
+                targetValue = when (phase) {
+                    VoicePhase.LISTENING -> listenColor
+                    VoicePhase.THINKING -> thinkColor
+                    VoicePhase.SPEAKING -> speakColor
+                    VoicePhase.IDLE -> MaterialTheme.colorScheme.primary
+                },
+                label = "micColor"
+            )
+            Box(
+                modifier = Modifier.fillMaxWidth().height(150.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                // Breathing pulse ring while listening (slow) or speaking (faster).
+                // Composed only in those phases, so it costs nothing when idle.
+                if (phase == VoicePhase.LISTENING || phase == VoicePhase.SPEAKING) {
+                    val period = if (phase == VoicePhase.LISTENING) 900 else 550
+                    val pulse = rememberInfiniteTransition(label = "pulse")
+                    val ringScale = pulse.animateFloat(
+                        initialValue = 1.0f,
+                        targetValue = 1.22f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = period),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "ringScale"
+                    )
+                    val ringAlpha = pulse.animateFloat(
+                        initialValue = 0.35f,
+                        targetValue = 0.08f,
+                        animationSpec = infiniteRepeatable(
+                            animation = tween(durationMillis = period),
+                            repeatMode = RepeatMode.Reverse
+                        ),
+                        label = "ringAlpha"
+                    )
+                    Box(
+                        modifier = Modifier
+                            .size(124.dp)
+                            .scale(ringScale.value)
+                            .background(
+                                micColor.value.copy(alpha = ringAlpha.value),
+                                CircleShape
+                            )
+                    )
+                }
                 Button(
                     onClick = onMic,
                     shape = CircleShape,
                     modifier = Modifier.size(120.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (state.listening.value) Color(0xFFB3261E)
-                        else MaterialTheme.colorScheme.primary
-                    )
+                    colors = ButtonDefaults.buttonColors(containerColor = micColor.value)
                 ) {
                     Text(
                         text = if (state.listening.value) "STOP" else "MIC",
                         fontSize = 20.sp
                     )
                 }
+                // Spinner ringing the button while a POST is in flight.
+                if (phase == VoicePhase.THINKING) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(136.dp),
+                        color = thinkColor,
+                        strokeWidth = 4.dp
+                    )
+                }
             }
+
+            // Big glanceable state label — readable while driving.
+            Text(
+                text = when (phase) {
+                    VoicePhase.LISTENING -> "Listening…"
+                    VoicePhase.THINKING -> "Thinking…"
+                    VoicePhase.SPEAKING -> "Speaking…"
+                    VoicePhase.IDLE -> "Tap to talk"
+                },
+                fontSize = 28.sp,
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center,
+                color = when (phase) {
+                    VoicePhase.LISTENING -> listenColor
+                    VoicePhase.THINKING -> thinkColor
+                    VoicePhase.SPEAKING -> speakColor
+                    VoicePhase.IDLE -> MaterialTheme.colorScheme.onSurface
+                },
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            )
 
             // Confirm (single-use nonce, never auto-run). Voice ("yes"/"no")
             // always works when pending; the button is the fallback.
