@@ -3,6 +3,15 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Foreground service keeps the mic alive while the screen is off /
+         another app is in front — driving mode's whole point. The MICROPHONE
+         type is mandatory on API 34 for a mic-using foreground service. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- Android 13+: lets the ongoing "listening" notification actually show.
+         Not requested at runtime yet — the service runs either way; without
+         the grant the notification is just hidden. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Normal permission (no runtime prompt): connectivity change cues in driving mode. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!-- Normal permission (no runtime prompt): eyes-free haptic cues (mic tick,
@@ -12,11 +21,11 @@
     <application
         android:label="COSMOS Voice"
         android:icon="@android:drawable/ic_btn_speak_now"
-        android:usesCleartextTraffic="true"
+        android:networkSecurityConfig="@xml/network_security_config"
         android:theme="@android:style/Theme.Material.NoActionBar">
-        <!-- usesCleartextTraffic=true is deliberate for the LAN trial
-             (http://192.168.x.x:8791). Tighten to a network-security-config
-             once the server has TLS or a Tailscale HTTPS URL. -->
+        <!-- Cleartext HTTP is scoped to the known LAN/Tailscale hosts in
+             res/xml/network_security_config.xml (the old global
+             usesCleartextTraffic=true allowed cleartext to ANY host). -->
 
         <activity
             android:name=".MainActivity"
@@ -27,6 +36,13 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- Mic foreground service: recognition survives the app going
+             off-screen (see VoiceService). -->
+        <service
+            android:name=".VoiceService"
+            android:exported="false"
+            android:foregroundServiceType="microphone" />
     </application>
 
 </manifest>

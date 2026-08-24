@@ -65,6 +65,7 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.UUID
 
 /** Observable UI state (plain Compose state holders, read via .value). */
 class AppState {
@@ -133,6 +134,10 @@ class MainActivity : ComponentActivity() {
     @Volatile private var ttsSpeaking = false
     @Volatile private var currentUtteranceKind = ""
 
+    // Client-side pending-confirm expiry: a stray "yes" minutes later must
+    // never fire a stale nonce, even if the server would still accept it.
+    private var confirmExpireJob: Job? = null
+
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
@@ -151,6 +156,7 @@ class MainActivity : ComponentActivity() {
 
         queue = OfflineQueue(prefs)
         state.queueSize.value = queue.size
+        queue.loadError?.let { log("OFFLINE QUEUE: $it") }
 
         state.hapticsOn.value = prefs.getBoolean("haptics_on", true)
         haptics = Haptics(this)
@@ -225,7 +231,22 @@ class MainActivity : ComponentActivity() {
         sherpaTts?.shutdown()
         tts?.stop()
         tts?.shutdown()
+        VoiceService.stop(this)
         super.onDestroy()
+    }
+
+    /** The mic foreground service runs while the mic is on OR driving mode is
+     *  active (driving mode restarts the mic on its own, so the service must
+     *  outlive transient listening=false moments). */
+    private fun updateMicService() {
+        val needed = state.listening.value || state.drivingMode.value
+        try {
+            if (needed) VoiceService.start(this) else VoiceService.stop(this)
+        } catch (e: Exception) {
+            // API 31+ refuses an FGS start from the background — the mic still
+            // works while the activity is up; log it instead of crashing.
+            log("MIC SERVICE: ${e.message?.take(80)}")
+        }
     }
 
     // ---------- speech output ----------
@@ -352,7 +373,9 @@ class MainActivity : ComponentActivity() {
         }
         state.drivingMode.value = on
         if (on) {
-            // Eyes-free: screen stays on so Android never pauses us mid-drive.
+            // Eyes-free: screen stays on so Android never pauses us mid-drive,
+            // and the mic foreground service keeps recognition alive even when
+            // the app does go off-screen (Maps, screen blank, pocket).
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             log("DRIVING MODE ON — hands-free, continuous listening, everything spoken.")
             speak("Driving mode on.")
@@ -366,6 +389,7 @@ class MainActivity : ComponentActivity() {
             speak("Driving mode off.")
             // Mic stays as-is; the MIC button controls it again.
         }
+        updateMicService()
     }
 
     /** Poll /status every ~20s while driving: detects signal coming back and
@@ -485,7 +509,10 @@ class MainActivity : ComponentActivity() {
 
     // ---------- voice model ----------
 
-    private fun downloadModel() {
+    /** resumeListening=true: after the download completes, go straight back
+     *  into listening (first-run recovery — the user asked for the mic; the
+     *  download was just in the way). */
+    private fun downloadModel(resumeListening: Boolean = false) {
         val st = state.modelStatus.value
         if (st == "downloading" || st == "unzipping") return
         state.modelStatus.value = "downloading"
@@ -501,7 +528,12 @@ class MainActivity : ComponentActivity() {
                 }
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "ready (not loaded)"
-                    log("Voice model ready. Tap MIC to start.")
+                    if (resumeListening || state.drivingMode.value) {
+                        log("Voice model ready — resuming listening.")
+                        startListening()
+                    } else {
+                        log("Voice model ready. Tap MIC to start.")
+                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -570,6 +602,14 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "error: ${e.message?.take(80)}"
                     log("MODEL LOAD FAILED: ${e.message}")
+                    if (state.drivingMode.value) {
+                        // DRIVING: a load error must not park the mic forever —
+                        // retry the whole recovery path in a few seconds.
+                        lifecycleScope.launch {
+                            delay(5_000)
+                            restartMicIfNeeded()
+                        }
+                    }
                 }
             }
         }
@@ -583,6 +623,7 @@ class MainActivity : ComponentActivity() {
             state.listening.value = false
             state.partial.value = ""
             log("Mic off.")
+            updateMicService()
             return
         }
         ensureMicOn()
@@ -602,13 +643,16 @@ class MainActivity : ComponentActivity() {
 
     private fun startListening() {
         if (!ModelManager.isReady(this)) {
-            downloadModel()
+            // First run: the user asked to listen — resume automatically once
+            // the model lands instead of making them tap MIC a second time.
+            downloadModel(resumeListening = true)
             return
         }
         ensureEngineLoaded {
             try {
                 voice?.start()
                 state.listening.value = true
+                updateMicService()
                 haptics.micStart() // short tick: "I'm hearing you" — no glance needed
                 log("Listening... speak, pause to send. Tap again to stop.")
                 cue("Listening.")
@@ -628,7 +672,28 @@ class MainActivity : ComponentActivity() {
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) return
-        val v = voice ?: return
+        val v = voice
+        if (v == null || !v.isLoaded) {
+            // The engine never loaded (or an earlier load failed). The old
+            // code early-returned here PERMANENTLY — a single model-load error
+            // left driving mode deaf until app restart. Re-run the full
+            // recovery path instead: download if needed, then load and start.
+            if (!ModelManager.isReady(this)) {
+                downloadModel(resumeListening = true)
+            } else {
+                ensureEngineLoaded {
+                    try {
+                        voice?.start()
+                        state.listening.value = true
+                        updateMicService()
+                        log("(mic auto-restarted after model load)")
+                    } catch (e: Exception) {
+                        scheduleMicRetry("MIC RESTART FAILED: ${e.message}")
+                    }
+                }
+            }
+            return
+        }
         if (v.isRunning) {
             state.listening.value = true
             return
@@ -638,11 +703,15 @@ class MainActivity : ComponentActivity() {
             state.listening.value = true
             log("(mic auto-restarted)")
         } catch (e: Exception) {
-            log("MIC RESTART FAILED: ${e.message} — retrying in 2s")
-            lifecycleScope.launch {
-                delay(2_000)
-                restartMicIfNeeded()
-            }
+            scheduleMicRetry("MIC RESTART FAILED: ${e.message}")
+        }
+    }
+
+    private fun scheduleMicRetry(msg: String) {
+        log("$msg — retrying in 2s")
+        lifecycleScope.launch {
+            delay(2_000)
+            restartMicIfNeeded()
         }
     }
 
@@ -681,6 +750,7 @@ class MainActivity : ComponentActivity() {
             if (VoiceGrammar.isYes(norm)) {
                 confirmPending()
             } else {
+                confirmExpireJob?.cancel()
                 state.pendingConfirmId.value = null
                 state.pendingTranscript.value = null
                 log("CANCELLED (heard: \"$raw\"). Nonce dropped.")
@@ -746,11 +816,16 @@ class MainActivity : ComponentActivity() {
         }
         haptics.sent()             // double-tick: recognized and on its way
         state.thinking.value = true // THINKING phase until the server answers
+        // Build the FULL request up front, request_id included, so the exact
+        // same request (same idempotency key) is what gets queued on failure
+        // and replayed by the flush — the server can dedupe a retry.
+        val body = JSONObject()
+            .put("transcript", transcript)
+            .put("request_id", UUID.randomUUID().toString())
+        state.sessionId.value?.let { body.put("session_id", it) }
+        if (confirmId != null) body.put("confirm_id", confirmId)
         lifecycleScope.launch(Dispatchers.IO) {
             try {
-                val body = JSONObject().put("transcript", transcript)
-                state.sessionId.value?.let { body.put("session_id", it) }
-                if (confirmId != null) body.put("confirm_id", confirmId)
                 val resp = CosmosClient.postVoice(base, state.token.value.trim(), body)
                 withContext(Dispatchers.Main) {
                     state.thinking.value = false
@@ -762,7 +837,7 @@ class MainActivity : ComponentActivity() {
                     state.thinking.value = false
                     log("SEND FAILED: ${e.message}")
                     onServerReachable(false)
-                    onSendFailed(transcript, confirmId)
+                    onSendFailed(transcript, confirmId, body)
                 }
             }
         }
@@ -783,15 +858,21 @@ class MainActivity : ComponentActivity() {
      *    not expect. The user re-issues the command instead.
      * =====================================================================
      */
-    private fun onSendFailed(transcript: String, confirmId: String?) {
+    private fun onSendFailed(transcript: String, confirmId: String?, body: JSONObject) {
         if (confirmId != null) {
             log("Confirm re-POST failed — nonce dropped (single-use, not queued).")
             if (state.drivingMode.value) {
                 speak("Couldn't reach COSMOS. The confirmation was not sent. Ask again when we're back online.")
             }
         } else {
-            queue.add(transcript)
+            // Queue the FULL request (request_id + session_id), not just the
+            // transcript — the flush replays it verbatim so the server can
+            // dedupe if the original POST actually landed.
+            val dropped = queue.add(body.toString())
             state.queueSize.value = queue.size
+            if (dropped > 0) {
+                log("QUEUE FULL (${OfflineQueue.MAX_ITEMS}) — dropped $dropped oldest item(s).")
+            }
             log("QUEUED offline (${queue.size} pending): \"$transcript\"")
             if (state.drivingMode.value) {
                 speak("Saved, no signal. I'll send it when we're back.")
@@ -815,17 +896,26 @@ class MainActivity : ComponentActivity() {
             try {
                 while (true) {
                     val item = queue.peek() ?: break
-                    val body = JSONObject().put("transcript", item)
-                    state.sessionId.value?.let { body.put("session_id", it) }
+                    // Items are full request bodies (JSON with request_id).
+                    // Legacy items from older builds are bare transcripts —
+                    // wrap those on the fly (they get a fresh request_id).
+                    val body = try {
+                        JSONObject(item)
+                    } catch (e: Exception) {
+                        JSONObject().put("transcript", item).also { b ->
+                            state.sessionId.value?.let { b.put("session_id", it) }
+                        }
+                    }
+                    val shownTranscript = body.optString("transcript", item)
                     val resp = CosmosClient.postVoice(base, state.token.value.trim(), body)
                     withContext(Dispatchers.Main) {
                         queue.removeFirst()
                         state.queueSize.value = queue.size
-                        log("FLUSHED: \"$item\"")
+                        log("FLUSHED: \"$shownTranscript\"")
                         // add=true: flushed replies queue up behind each other
                         // instead of each one cutting off the last. Flushed
                         // dictation stays silent (server `kind` rule applies).
-                        handleReply(item, resp, add = true)
+                        handleReply(shownTranscript, resp, add = true)
                     }
                 }
             } catch (e: Exception) {
@@ -859,6 +949,18 @@ class MainActivity : ComponentActivity() {
             if (cid.isNotBlank()) {
                 state.pendingConfirmId.value = cid
                 state.pendingTranscript.value = original
+                // Client-side expiry: after CONFIRM_TTL_MS a stray "yes"/"ok"
+                // can no longer fire this nonce, whatever the server would say.
+                confirmExpireJob?.cancel()
+                confirmExpireJob = lifecycleScope.launch {
+                    delay(CONFIRM_TTL_MS)
+                    if (state.pendingConfirmId.value == cid) {
+                        state.pendingConfirmId.value = null
+                        state.pendingTranscript.value = null
+                        log("CONFIRM EXPIRED (${CONFIRM_TTL_MS / 1000}s) — nonce dropped.")
+                        if (state.drivingMode.value) speak("That confirmation expired.")
+                    }
+                }
                 // Two strong pulses: a consequential confirm is FELT, not just heard.
                 haptics.alert()
                 log("NEEDS CONFIRM — say yes/no (or tap CONFIRM). Never auto-run.")
@@ -916,6 +1018,7 @@ class MainActivity : ComponentActivity() {
     private fun confirmPending() {
         val cid = state.pendingConfirmId.value ?: return
         val original = state.pendingTranscript.value ?: ""
+        confirmExpireJob?.cancel()
         state.pendingConfirmId.value = null
         state.pendingTranscript.value = null
         log("CONFIRMING (nonce ${cid.take(8)}...)")
@@ -931,6 +1034,11 @@ class MainActivity : ComponentActivity() {
         while (state.console.size > 300) {
             state.console.removeAt(state.console.size - 1)
         }
+    }
+
+    private companion object {
+        /** How long a pending confirm nonce stays live on the client. */
+        const val CONFIRM_TTL_MS = 30_000L
     }
 }
 
