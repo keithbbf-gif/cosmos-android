@@ -34,11 +34,21 @@ class VoiceEngine(
 
     /** Start continuous listening. Throws IOException if the mic cannot open.
      *  Idempotent: a second start() while running is a no-op, so the driving-mode
-     *  auto-restart path can call it defensively. */
-    fun start() {
+     *  auto-restart path can call it defensively.
+     *
+     *  grammarJson: a VOSK grammar — a JSON array of allowed phrases plus
+     *  "[unk]" (see VoiceGrammar.commandGrammarJson). Non-null = COMMAND mode:
+     *  the recognizer can only ever emit those phrases (or [unk]), which kills
+     *  the small-model free-form hallucination ("let's look at that it looks
+     *  like to me") on marginal mic audio. Null = OPEN dictation. Switching
+     *  modes requires stop() then start() with the other value — the grammar
+     *  is baked into the Recognizer at construction. */
+    fun start(grammarJson: String? = null) {
         if (speechService != null) return
         val m = model ?: throw IllegalStateException("VOSK model not loaded")
-        val recognizer = Recognizer(m, 16000.0f)
+        val recognizer =
+            if (grammarJson != null) Recognizer(m, 16000.0f, grammarJson)
+            else Recognizer(m, 16000.0f)
         val service = SpeechService(recognizer, 16000.0f)
         speechService = service
         service.startListening(this)

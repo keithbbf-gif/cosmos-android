@@ -94,6 +94,14 @@ class AppState {
     val speaking = mutableStateOf(false)   // TTS is audibly talking
     val thinking = mutableStateOf(false)   // a POST to COSMOS is in flight
     val hapticsOn = mutableStateOf(true)   // settings toggle, persisted
+
+    // ---- recognition mode ----
+    // false = COMMAND mode (grammar-constrained VOSK — no hallucinated
+    // sentences); true = DICTATE mode (open recognition for one utterance).
+    val dictateMode = mutableStateOf(false)
+    // Settings toggle: force the built-in phone mic even when a Bluetooth
+    // headset is connected (BT SCO narrowband mics wreck recognition).
+    val phoneMicOn = mutableStateOf(true)
 }
 
 /** The one visual phase the mic button + big label reflect. Priority when
@@ -209,7 +217,8 @@ class MainActivity : ComponentActivity() {
                     onConfirm = { confirmPending() },
                     onSave = { saveSettings() },
                     onDriving = { setDrivingMode(!state.drivingMode.value) },
-                    onHaptics = { on -> setHaptics(on) }
+                    onHaptics = { on -> setHaptics(on) },
+                    onDictate = { setDictateMode(!state.dictateMode.value) }
                 )
             }
         }
@@ -615,6 +624,44 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------- recognition mode (COMMAND grammar vs open DICTATE) ----------
+
+    /** Grammar for the CURRENT mode: command mode constrains VOSK to the
+     *  COSMOS vocabulary (null = open dictation). */
+    private fun currentGrammar(): String? =
+        if (state.dictateMode.value) null else VoiceGrammar.commandGrammarJson()
+
+    /**
+     * Switch COMMAND <-> DICTATE. The grammar is baked into the Recognizer at
+     * construction, so a live recognizer is stopped and rebuilt with (or
+     * without) the grammar. DICTATE auto-reverts after one open utterance
+     * (or on "done").
+     */
+    private fun setDictateMode(on: Boolean, announce: Boolean = true) {
+        if (state.dictateMode.value == on) return
+        state.dictateMode.value = on
+        if (announce) {
+            log(if (on) "DICTATE mode — speak freely; one utterance, then back to commands (or say \"done\")."
+                else "COMMAND mode — grammar-constrained recognition.")
+            if (on) cue("Dictating.") else cue("Commands.")
+        }
+        if (state.listening.value) restartRecognizer()
+    }
+
+    /** Rebuild the live recognizer for the current mode/mic-route settings. */
+    private fun restartRecognizer() {
+        val v = voice ?: return
+        v.stop()
+        try {
+            v.start(currentGrammar())
+            state.listening.value = true
+        } catch (e: Exception) {
+            log("MIC RESTART FAILED: ${e.message}")
+            state.listening.value = false
+            if (state.drivingMode.value) scheduleMicRetry("recognizer rebuild failed")
+        }
+    }
+
     // ---------- mic ----------
 
     private fun toggleMic() {
@@ -650,11 +697,12 @@ class MainActivity : ComponentActivity() {
         }
         ensureEngineLoaded {
             try {
-                voice?.start()
+                voice?.start(currentGrammar())
                 state.listening.value = true
                 updateMicService()
                 haptics.micStart() // short tick: "I'm hearing you" — no glance needed
-                log("Listening... speak, pause to send. Tap again to stop.")
+                log("Listening (${if (state.dictateMode.value) "DICTATE" else "COMMAND"} mode)... " +
+                    "speak, pause to send. Tap again to stop.")
                 cue("Listening.")
             } catch (e: Exception) {
                 log("MIC START FAILED: ${e.message}")
@@ -683,7 +731,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 ensureEngineLoaded {
                     try {
-                        voice?.start()
+                        voice?.start(currentGrammar())
                         state.listening.value = true
                         updateMicService()
                         log("(mic auto-restarted after model load)")
@@ -699,7 +747,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
-            v.start()
+            v.start(currentGrammar())
             state.listening.value = true
             log("(mic auto-restarted)")
         } catch (e: Exception) {
@@ -719,7 +767,13 @@ class MainActivity : ComponentActivity() {
 
     private fun onFinalTranscript(text: String) {
         state.partial.value = ""
+        // COMMAND mode's grammar surfaces out-of-vocabulary audio as "[unk]"
+        // tokens instead of hallucinated sentences. Strip them; a final that
+        // was ALL [unk] (road noise, side chatter) vanishes here.
         val raw = text.trim()
+            .replace("[unk]", " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
         if (raw.isBlank()) return
         val norm = VoiceGrammar.normalize(raw)
 
@@ -760,6 +814,27 @@ class MainActivity : ComponentActivity() {
         }
 
         log("YOU: $raw")
+
+        // ===================== RECOGNITION MODE SWITCH =====================
+        // DICTATE mode: this final IS the dictated utterance (open decode).
+        // "done" ends dictation without sending; anything else is sent as-is
+        // and the recognizer auto-reverts to grammar-constrained COMMAND mode.
+        if (state.dictateMode.value) {
+            if (VoiceGrammar.isDictateDone(norm)) {
+                setDictateMode(false)
+                return
+            }
+            send(raw, null, quiet = false)
+            setDictateMode(false) // one open utterance, then back to commands
+            return
+        }
+        // COMMAND mode: a bare "ask"/"dictate"/"start dictation" opens the
+        // recognizer for free speech (the grammar blocks arbitrary text, so
+        // the switch has to be explicit).
+        if (VoiceGrammar.isDictateStart(norm)) {
+            setDictateMode(true)
+            return
+        }
 
         // Voice control of driving mode itself ("driving mode on/off").
         if (VoiceGrammar.isDrivingOff(norm)) {
@@ -1052,7 +1127,8 @@ fun AppScreen(
     onConfirm: () -> Unit,
     onSave: () -> Unit,
     onDriving: () -> Unit,
-    onHaptics: (Boolean) -> Unit
+    onHaptics: (Boolean) -> Unit,
+    onDictate: () -> Unit
 ) {
     // One visual phase drives the mic button, pulse ring, spinner, and the
     // big glanceable label. Priority: SPEAKING > THINKING > LISTENING > IDLE.
@@ -1156,6 +1232,24 @@ fun AppScreen(
                     progress = state.modelProgress.value / 100f,
                     modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
                 )
+            }
+
+            // Recognition-mode indicator + toggle: COMMAND (grammar) / DICTATE
+            // (open speech, one utterance). Also voice: "ask" / "done".
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+            ) {
+                Text(
+                    text = if (state.dictateMode.value) "● DICTATE" else "● COMMAND",
+                    color = if (state.dictateMode.value) Color(0xFF1565C0) else Color(0xFF2E7D32),
+                    fontWeight = FontWeight.Bold,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onDictate) {
+                    Text(if (state.dictateMode.value) "back to commands" else "Dictate")
+                }
             }
 
             // Live partial transcript

@@ -14,11 +14,12 @@ import java.util.Locale
  */
 object VoiceGrammar {
 
-    /** First words the COSMOS server treats as verbs. Used only for the junk
-     *  DROP gate and the pre-send cue hint — never to moderate what the
-     *  reply SPEAKS (the server's `kind` decides that), and never what gets
-     *  SENT (non-verb speech still goes up as dictation). */
-    private val VERBS = setOf(
+    /** First words the COSMOS server treats as verbs. SINGLE SOURCE OF TRUTH
+     *  for the command vocabulary: the junk DROP gate, the pre-send cue hint,
+     *  AND the command-mode recognition grammar (commandGrammarJson) are all
+     *  built from this set so they cannot drift. Never used to moderate what
+     *  the reply SPEAKS (the server's `kind` decides that). */
+    val VERBS = setOf(
         "status", "health", "jobs", "spend", "rails", "makers", "events",
         "help", "submit", "session", "search", "open", "ask"
     )
@@ -41,6 +42,42 @@ object VoiceGrammar {
     private val YES_PHRASES = setOf(
         "do it", "go ahead", "send it", "yes please", "go for it", "confirm it"
     )
+
+    /** Utterances that switch the recognizer into OPEN dictation (no grammar)
+     *  for one utterance. "ask" doubles as a verb; a BARE "ask" means "let me
+     *  dictate a question". */
+    private val DICTATE_START = setOf("ask", "dictate", "dictation", "start dictation")
+
+    /** Utterances that end dictation without sending anything. */
+    private val DICTATE_DONE = setOf("done", "stop dictation", "end dictation")
+
+    fun isDictateStart(norm: String): Boolean = stripWake(normalize(norm)) in DICTATE_START
+    fun isDictateDone(norm: String): Boolean = stripWake(normalize(norm)) in DICTATE_DONE
+
+    /**
+     * VOSK command-mode grammar: a JSON array of every phrase the recognizer
+     * is ALLOWED to emit, plus "[unk]" (anything else surfaces as [unk]
+     * instead of being force-fitted into a hallucinated English sentence).
+     * Built from VERBS + confirm/cancel words + driving toggles + dictation
+     * triggers, so the grammar and the classifier share one vocabulary.
+     */
+    fun commandGrammarJson(): String {
+        val phrases = LinkedHashSet<String>()
+        phrases += VERBS
+        phrases += "new session"
+        phrases += YES_WORDS
+        phrases += YES_PHRASES
+        phrases += setOf("no", "nope", "cancel", "stop", "negative")
+        phrases += setOf(
+            "driving mode on", "driving mode off",
+            "driving mode start", "driving mode stop"
+        )
+        phrases += DICTATE_START
+        phrases += DICTATE_DONE
+        phrases += "cosmos"
+        phrases += "[unk]"
+        return JSONArray(phrases.toList()).toString()
+    }
 
     /** Lowercase, strip punctuation, collapse whitespace. */
     fun normalize(raw: String): String =
