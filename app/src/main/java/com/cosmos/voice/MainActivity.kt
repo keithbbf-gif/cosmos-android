@@ -147,6 +147,16 @@ class MainActivity : ComponentActivity() {
     // never fire a stale nonce, even if the server would still accept it.
     private var confirmExpireJob: Job? = null
 
+    // ==================== USER-INTENT MIC FLAG ====================
+    // true after the user taps STOP: the mic must STAY off. The driving-mode
+    // watchdog (restartMicIfNeeded) and its retry loop (scheduleMicRetry)
+    // NO-OP while this is set — a hard stop is a hard stop. Cleared ONLY by
+    // an explicit user start (MIC tap) or by turning driving mode on.
+    // This is the fix for the field bug where STOP was silently defeated:
+    // toggleMic() stopped the recognizer, then the watchdog restarted it,
+    // so the mic was effectively always-on and captured ambient speech.
+    @Volatile private var userPaused = false
+
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) {
@@ -399,6 +409,7 @@ class MainActivity : ComponentActivity() {
             window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
             log("DRIVING MODE ON — hands-free, continuous listening, everything spoken.")
             speak("Driving mode on.")
+            userPaused = false // explicit opt-in to continuous listening
             startPolling()
             ensureMicOn()
         } else {
@@ -407,7 +418,8 @@ class MainActivity : ComponentActivity() {
             pollJob = null
             log("DRIVING MODE OFF.")
             speak("Driving mode off.")
-            // Mic stays as-is; the MIC button controls it again.
+            // Mic stays as-is for this moment; outside driving mode it is
+            // TAP-TO-TALK — the next final stops it (see stopAfterUtterance).
         }
         updateMicService()
     }
@@ -714,15 +726,45 @@ class MainActivity : ComponentActivity() {
     // ---------- mic ----------
 
     private fun toggleMic() {
+        // Tap barge-in: a deliberate mic tap silences the TTS immediately —
+        // it must never keep talking over the user (or pile up repeats).
+        if (ttsSpeaking) {
+            stopSpeaking()
+            ttsSpeaking = false
+            currentUtteranceKind = ""
+            state.speaking.value = false
+        }
         if (state.listening.value) {
+            // STOP IS AUTHORITATIVE. Set the user-intent flag FIRST so no
+            // watchdog/retry that is already in flight can win the race,
+            // then drop driving mode too — continuous listening is an
+            // explicit opt-in, and a hard stop ends it.
+            userPaused = true
+            if (state.drivingMode.value) setDrivingMode(false)
             voice?.stop()
             state.listening.value = false
             state.partial.value = ""
-            log("Mic off.")
+            log("Mic off — stays off until you tap MIC.")
             updateMicService()
             return
         }
+        userPaused = false // explicit user start re-arms the mic
         ensureMicOn()
+    }
+
+    /** TAP-TO-TALK — the SAFE DEFAULT outside driving mode: one MIC tap
+     *  listens for ONE utterance; when its final arrives the mic stops and
+     *  the app returns to idle, so ambient conversation is never continuously
+     *  captured. Continuous always-on listening exists ONLY as the explicit
+     *  DRIVING MODE opt-in (this is a no-op while driving mode is on). */
+    private fun stopAfterUtterance() {
+        if (state.drivingMode.value) return
+        if (!state.listening.value) return
+        voice?.stop()
+        state.listening.value = false
+        state.partial.value = ""
+        updateMicService()
+        log("(mic idle — tap MIC to talk again)")
     }
 
     /** Turn the mic on if it is off, requesting permission when needed. */
@@ -751,8 +793,13 @@ class MainActivity : ComponentActivity() {
                 state.listening.value = true
                 updateMicService()
                 haptics.micStart() // short tick: "I'm hearing you" — no glance needed
-                log("Listening (${if (state.dictateMode.value) "DICTATE" else "COMMAND"} mode)... " +
-                    "speak, pause to send. Tap again to stop.")
+                log(
+                    if (state.drivingMode.value)
+                        "Listening continuously (DRIVING MODE)... tap STOP to end."
+                    else
+                        "Listening (${if (state.dictateMode.value) "DICTATE" else "COMMAND"} mode)... " +
+                            "speak, pause to send — mic stops after one utterance."
+                )
                 cue("Listening.")
             } catch (e: Exception) {
                 log("MIC START FAILED: ${e.message}")
@@ -766,6 +813,7 @@ class MainActivity : ComponentActivity() {
      *  Retries every 2s while driving mode stays on; stops retrying the
      *  moment driving mode turns off. */
     private fun restartMicIfNeeded() {
+        if (userPaused) return // the user said STOP — the mic stays off
         if (!state.drivingMode.value) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
@@ -808,6 +856,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scheduleMicRetry(msg: String) {
+        if (userPaused) return // the user said STOP — no retry loop
         log("$msg — retrying in 2s")
         lifecycleScope.launch {
             delay(2_000)
@@ -862,6 +911,7 @@ class MainActivity : ComponentActivity() {
                 log("CANCELLED (heard: \"$raw\"). Nonce dropped.")
                 speak("Cancelled.")
             }
+            stopAfterUtterance() // confirm answered — tap-to-talk goes idle
             return
         }
 
@@ -873,11 +923,13 @@ class MainActivity : ComponentActivity() {
         // and the recognizer auto-reverts to grammar-constrained COMMAND mode.
         if (state.dictateMode.value) {
             if (VoiceGrammar.isDictateDone(norm)) {
+                stopAfterUtterance() // stop FIRST so setDictateMode does not rebuild a live recognizer
                 setDictateMode(false)
                 return
             }
             send(raw, null, quiet = false)
-            setDictateMode(false) // one open utterance, then back to commands
+            stopAfterUtterance() // one open utterance, then idle (tap-to-talk)
+            setDictateMode(false) // back to commands for the next tap
             return
         }
         // COMMAND mode: a bare "ask"/"dictate"/"start dictation" opens the
@@ -891,6 +943,7 @@ class MainActivity : ComponentActivity() {
         // Voice control of driving mode itself ("driving mode on/off").
         if (VoiceGrammar.isDrivingOff(norm)) {
             setDrivingMode(false)
+            stopAfterUtterance() // leaving continuous mode -> idle, not hot mic
             return
         }
         if (VoiceGrammar.isDrivingOn(norm)) {
@@ -898,14 +951,18 @@ class MainActivity : ComponentActivity() {
             return
         }
 
+        // Junk gate — BOTH modes: road noise, filler words ("huh", "uh huh"),
+        // and fragments with no real content and no COSMOS verb are dropped
+        // entirely — never sent, never spoken about, no reaction of any kind.
+        // (The [unk]-strip above already vanished pure-noise finals the same
+        // way.) In driving mode the mic stays hot for the next real utterance;
+        // in tap-to-talk it keeps waiting for the utterance the user tapped
+        // for — STOP is always one tap away.
+        if (VoiceGrammar.isJunk(norm)) {
+            log("(ignored as noise: \"$raw\")")
+            return
+        }
         if (state.drivingMode.value) {
-            // Junk gate: road noise, filler words ("huh", "uh huh"), and
-            // fragments with no real content and no COSMOS verb are dropped
-            // entirely — never sent, never spoken about.
-            if (VoiceGrammar.isJunk(norm)) {
-                log("(ignored as noise: \"$raw\")")
-                return
-            }
             // Everything else goes to COSMOS — the SERVER classifies it and
             // returns `kind`; the SPOKEN reply is moderated in handleReply
             // from that classification, never from a client-side verb guess
@@ -916,6 +973,7 @@ class MainActivity : ComponentActivity() {
             send(raw, null, quiet = !VoiceGrammar.startsWithKnownVerb(norm))
         } else {
             send(raw, null, quiet = false)
+            stopAfterUtterance() // tap-to-talk: one utterance per tap
         }
     }
 
@@ -1394,8 +1452,18 @@ fun AppScreen(
                     colors = ButtonDefaults.buttonColors(containerColor = micColor.value)
                 ) {
                     Text(
-                        text = if (state.listening.value) "STOP" else "MIC",
-                        fontSize = 20.sp
+                        // MIC = idle, tap to capture ONE utterance.
+                        // LISTENING = tap-to-talk capture in progress (auto-
+                        //             stops on end of speech; tap cancels).
+                        // STOP = driving mode's continuous listening — tap for
+                        //        a hard stop (also exits driving mode).
+                        text = when {
+                            !state.listening.value -> "MIC"
+                            state.drivingMode.value -> "STOP"
+                            else -> "LISTENING"
+                        },
+                        fontSize = 20.sp,
+                        textAlign = TextAlign.Center
                     )
                 }
                 // Spinner ringing the button while a POST is in flight.
