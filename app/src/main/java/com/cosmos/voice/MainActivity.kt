@@ -97,6 +97,12 @@ import java.util.UUID
  *            PHONE — never sent, never queued, never spends. After a
  *            reply, a ~10s follow-up window accepts ONE utterance without
  *            the wake word (natural back-and-forth), then gating resumes.
+ *            SUB-MODE (requireWake, settings toggle, default ON): turning
+ *            "Require Cosmos trigger word" OFF makes WAKE an OPEN listener —
+ *            every utterance that passes the junk gate is sent, no wake word.
+ *            This changes ONLY which utterances are sent; master OFF, the
+ *            late-final drop, send()'s stop-gate, and the remote control
+ *            channel are identical in both sub-modes.
  *   MicMode.TAP  tap-to-talk: one tap captures ONE utterance, auto-
  *            endpoints on Vosk final / ~1s silence, then mic idle.
  *   MicMode.PTT  push-to-talk: hold the mic button; release sends.
@@ -175,6 +181,12 @@ class AppState {
     val micMode = mutableStateOf(MicMode.WAKE)
     // Follow-up window open: ONE utterance is accepted without the wake word.
     val followUp = mutableStateOf(false)
+    // WAKE mode only: TRUE (default) = only "Cosmos ..." utterances are sent;
+    // FALSE = OPEN listening — while MIC is ON, every utterance that passes
+    // the junk gate is sent, no trigger word needed. TAP/PTT are unaffected.
+    // Gates only WHICH utterances are sent — never whether the mic can be
+    // stopped: master OFF / STOP / remote control are untouched. Persisted.
+    val requireWake = mutableStateOf(true)
 }
 
 /** The one visual phase the mic button + big label reflect. Priority when
@@ -323,6 +335,9 @@ class MainActivity : ComponentActivity() {
             MicMode.WAKE
         }
         val rememberedMicOn = prefs.getBoolean("master_mic_on", false)
+        // Trigger-word requirement (WAKE mode). Default TRUE — open listening
+        // is always an explicit opt-in, never how the app comes up unasked.
+        state.requireWake.value = prefs.getBoolean("require_wake", true)
 
         state.stream.value = prefs.getString("stream", "plumbing") ?: "plumbing"
         state.verbosity.value = prefs.getString("verbosity", "normal") ?: "normal"
@@ -389,6 +404,7 @@ class MainActivity : ComponentActivity() {
                     onHaptics = { on -> setHaptics(on) },
                     onDictate = { setDictateMode(!state.dictateMode.value) },
                     onPhoneMic = { on -> setPhoneMic(on) },
+                    onRequireWake = { on -> setRequireWake(on) },
                     onOfflineQueue = { on -> setOfflineQueue(on) },
                     onStream = { s -> setStream(s) },
                     onBootUp = { bootUp() },
@@ -506,7 +522,9 @@ class MainActivity : ComponentActivity() {
         val needed = st != MicState.OFF || speaking
         val label = when {
             st == MicState.LISTENING_WAKE ->
-                "Hands-free — only \"Cosmos ...\" is sent. Tap STOP to end."
+                if (state.requireWake.value)
+                    "Hands-free — only \"Cosmos ...\" is sent. Tap STOP to end."
+                else "OPEN listening — everything you say is sent. Tap STOP to end."
             st == MicState.LISTENING_PTT -> "Listening (hold-to-talk)"
             st == MicState.LISTENING_T2T -> "Listening (one utterance)"
             speaking -> "Speaking"
@@ -697,9 +715,15 @@ class MainActivity : ComponentActivity() {
         when (state.micMode.value) {
             MicMode.WAKE -> {
                 window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-                log("MIC ON — hands-free. Say \"Cosmos ...\"; everything else is " +
-                    "decoded on the phone and dropped.")
-                speak("Mic on. Say cosmos, then your command.")
+                if (state.requireWake.value) {
+                    log("MIC ON — hands-free. Say \"Cosmos ...\"; everything else is " +
+                        "decoded on the phone and dropped.")
+                    speak("Mic on. Say cosmos, then your command.")
+                } else {
+                    log("MIC ON — OPEN listening: everything you say (minus noise) " +
+                        "is SENT to COSMOS. STOP always wins.")
+                    speak("Mic on. Open listening. Everything you say is sent.")
+                }
                 startPolling()
                 ensureMicOn(MicState.LISTENING_WAKE)
             }
@@ -760,6 +784,9 @@ class MainActivity : ComponentActivity() {
      *  wake word. Shown in the UI; closed by consumption, timeout, or STOP. */
     private fun openFollowUp(ms: Long) {
         if (!handsFree) return
+        // OPEN listening (trigger word off): everything is already a command —
+        // the window is meaningless, so it never opens (nor shows in the UI).
+        if (!state.requireWake.value) return
         followUpUntilMs = System.currentTimeMillis() + ms
         state.followUp.value = true
         followUpJob?.cancel()
@@ -987,6 +1014,26 @@ class MainActivity : ComponentActivity() {
         if (state.micState.value != MicState.OFF) restartRecognizer()
     }
 
+    /** "Require 'Cosmos' trigger word" toggle — WAKE mode only, persisted,
+     *  default ON. OFF = OPEN listening: while MIC is ON, every utterance
+     *  that passes the junk gate is SENT, no trigger word needed. This gates
+     *  only WHICH utterances are sent — it never touches the stop path:
+     *  master OFF (performStop), the late-final drop, the send() stop-gate,
+     *  and the remote control channel apply identically in both sub-modes. */
+    private fun setRequireWake(on: Boolean) {
+        if (state.requireWake.value == on) return
+        state.requireWake.value = on
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putBoolean("require_wake", on)
+            .apply()
+        closeFollowUp() // the window only means something while gating is on
+        log(if (on) "TRIGGER WORD REQUIRED — only \"Cosmos ...\" is sent (WAKE mode)."
+            else "TRIGGER WORD OFF — OPEN listening: while MIC is ON, everything " +
+                "you say (minus noise) is SENT to COSMOS. STOP always wins.")
+        if (handsFree) cue(if (on) "Trigger word required." else "Open listening.")
+        updateMicService() // notification label names the active sub-mode
+    }
+
     /** Haptics on/off toggle — persisted, default ON. */
     private fun setHaptics(on: Boolean) {
         state.hapticsOn.value = on
@@ -1098,9 +1145,11 @@ class MainActivity : ComponentActivity() {
                             // barge-in (echo guard — the phone can hear its
                             // own prompt); and in WAKE mode ambient speech
                             // must not cut replies — barging needs the wake
-                            // word in the partial, or an open follow-up window.
+                            // word in the partial, or an open follow-up window
+                            // (or OPEN listening, where all speech is command).
                             if (p.isNotBlank() && ttsSpeaking && currentUtteranceKind != "confirm" &&
                                 (state.micState.value != MicState.LISTENING_WAKE ||
+                                    !state.requireWake.value ||
                                     p.contains("cosmos") || followUpOpen())
                             ) {
                                 bargeInStopTts()
@@ -1328,8 +1377,12 @@ class MainActivity : ComponentActivity() {
                 log(
                     when (target) {
                         MicState.LISTENING_WAKE ->
-                            "Hands-free listening... say \"Cosmos ...\" — everything " +
-                                "else is dropped on the phone. STOP or the toggle ends it."
+                            if (state.requireWake.value)
+                                "Hands-free listening... say \"Cosmos ...\" — everything " +
+                                    "else is dropped on the phone. STOP or the toggle ends it."
+                            else
+                                "OPEN listening... everything you say (minus noise) is " +
+                                    "SENT. STOP or the toggle ends it."
                         MicState.LISTENING_PTT ->
                             "Listening (hold-to-talk)... release to send."
                         else ->
@@ -1499,7 +1552,30 @@ class MainActivity : ComponentActivity() {
         var text = raw
         var normText = norm
         if (state.micState.value == MicState.LISTENING_WAKE) {
-            when {
+            if (!state.requireWake.value) {
+                // ============ OPEN LISTENING (trigger word OFF) ============
+                // The user explicitly turned the wake requirement off: every
+                // utterance is a candidate command — only the junk gate below
+                // (VoiceGrammar.isJunk) drops filler/fragments. A spoken wake
+                // word still works and is stripped, so "cosmos status" and
+                // "status" behave identically. The follow-up window is
+                // meaningless here (everything is a command). EVERY safety
+                // gate is untouched: the userStopped drop above, the stop
+                // check below, send()'s stop-gate, pause, and dedupe all
+                // apply exactly as in gated mode.
+                closeFollowUp()
+                if (VoiceGrammar.hasWake(norm)) {
+                    wakeTick()
+                    val rest = VoiceGrammar.stripWake(norm)
+                    if (rest.isBlank()) {
+                        log("YOU: $raw")
+                        log("(wake word — open listening is already on, just speak)")
+                        return
+                    }
+                    text = rest
+                    normText = rest
+                }
+            } else when {
                 VoiceGrammar.hasWake(norm) -> {
                     wakeTick() // wake word heard — tick BEFORE taking the command
                     val rest = VoiceGrammar.stripWake(norm)
@@ -1972,6 +2048,7 @@ fun AppScreen(
     onHaptics: (Boolean) -> Unit,
     onDictate: () -> Unit,
     onPhoneMic: (Boolean) -> Unit,
+    onRequireWake: (Boolean) -> Unit,
     onOfflineQueue: (Boolean) -> Unit,
     onStream: (String) -> Unit,
     onBootUp: () -> Unit,
@@ -2027,11 +2104,13 @@ fun AppScreen(
             ) {
                 Text(
                     text = if (masterOn) {
-                        if (state.micMode.value == MicMode.WAKE)
-                            "MIC ON · say \"Cosmos …\""
-                        else "MIC ON"
+                        if (state.micMode.value == MicMode.WAKE) {
+                            if (state.requireWake.value) "MIC ON · say \"Cosmos …\""
+                            else "MIC ON · OPEN — everything you say is sent"
+                        } else "MIC ON"
                     } else "MIC OFF — tap to turn on",
-                    fontSize = 20.sp,
+                    fontSize = if (masterOn && state.micMode.value == MicMode.WAKE &&
+                        !state.requireWake.value) 17.sp else 20.sp,
                     fontWeight = FontWeight.Bold,
                     textAlign = TextAlign.Center
                 )
@@ -2072,7 +2151,9 @@ fun AppScreen(
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "● HANDS-FREE — only \"Cosmos …\" is sent",
+                        text = if (state.requireWake.value)
+                            "● HANDS-FREE — only \"Cosmos …\" is sent"
+                        else "● OPEN MIC — everything you say is sent",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
                         fontSize = 16.sp
@@ -2162,6 +2243,23 @@ fun AppScreen(
                     Switch(
                         checked = state.phoneMicOn.value,
                         onCheckedChange = onPhoneMic
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(text = "Require \"Cosmos\" trigger word")
+                        Text(
+                            text = "OFF = open listening: while MIC is ON everything " +
+                                "you say is sent (WAKE mode only)",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = state.requireWake.value,
+                        onCheckedChange = onRequireWake
                     )
                 }
                 Row(
@@ -2348,7 +2446,9 @@ fun AppScreen(
             }
             Text(
                 text = when (state.micMode.value) {
-                    MicMode.WAKE -> "say \"Cosmos …\" · tap the circle to interrupt speech"
+                    MicMode.WAKE -> if (state.requireWake.value)
+                        "say \"Cosmos …\" · tap the circle to interrupt speech"
+                    else "open listening — everything is sent · tap the circle to interrupt"
                     MicMode.TAP -> "tap = one utterance · hold = push-to-talk"
                     MicMode.PTT -> "hold = talk · release = send"
                 },
@@ -2372,7 +2472,9 @@ fun AppScreen(
                     VoicePhase.LISTENING -> when {
                         mic == MicState.LISTENING_WAKE && state.followUp.value ->
                             "Follow-up — just speak"
-                        mic == MicState.LISTENING_WAKE -> "Say \"Cosmos …\""
+                        mic == MicState.LISTENING_WAKE ->
+                            if (state.requireWake.value) "Say \"Cosmos …\""
+                            else "Open mic — all speech sent"
                         else -> "Listening…"
                     }
                     VoicePhase.THINKING -> "Thinking…"
