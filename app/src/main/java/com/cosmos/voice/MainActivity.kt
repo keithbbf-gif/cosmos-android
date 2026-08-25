@@ -20,6 +20,7 @@ import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -29,9 +30,11 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -39,6 +42,7 @@ import androidx.compose.material3.Divider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -50,14 +54,20 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelChildren
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -68,6 +78,30 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
+/**
+ * ======================== THE MIC STATE MACHINE ========================
+ *
+ *   OFF            default. The mic is closed. NOTHING opens it except an
+ *                  explicit user action (tap, hold, or the confirmed
+ *                  CONTINUOUS opt-in). Not launch, not reconnect, not a
+ *                  server message, not a watchdog, not a retry.
+ *   LISTENING_T2T  tap-to-talk (the default gesture): one tap captures ONE
+ *                  utterance, auto-endpoints on Vosk final / ~1s silence,
+ *                  then returns to OFF.
+ *   LISTENING_PTT  push-to-talk: hold the mic button — press opens the mic,
+ *                  release endpoints and sends. Back to OFF.
+ *   CONTINUOUS     always-listening. Entered ONLY through the two-step
+ *                  opt-in (button + confirm dialog); a persistent red
+ *                  "LIVE" banner shows the whole time. Exits via STOP.
+ *
+ * STOP (big red button, notification action, remote mic_off, spoken "stop")
+ * is AUTHORITATIVE: from any state -> OFF; kills recognizer, TTS, in-flight
+ * HTTP, and the local queue; sets userStopped so every watchdog/retry is a
+ * no-op until the user explicitly starts the mic again.
+ * =======================================================================
+ */
+enum class MicState { OFF, LISTENING_T2T, LISTENING_PTT, CONTINUOUS }
+
 /** Observable UI state (plain Compose state holders, read via .value). */
 class AppState {
     val baseUrl = mutableStateOf("http://192.168.1.107:8791")
@@ -76,7 +110,7 @@ class AppState {
     val modelStatus = mutableStateOf("checking")
     val modelProgress = mutableStateOf(0)
     val ttsStatus = mutableStateOf("checking")
-    val listening = mutableStateOf(false)
+    val micState = mutableStateOf(MicState.OFF)
     val partial = mutableStateOf("")
     val sessionId = mutableStateOf<String?>(null)
     val pendingConfirmId = mutableStateOf<String?>(null)
@@ -84,14 +118,16 @@ class AppState {
     val console = mutableStateListOf<String>()
     val showSettings = mutableStateOf(true)
 
-    // ---- driving mode ----
-    val drivingMode = mutableStateOf(false)
+    // ---- network / queue ----
     val netStatus = mutableStateOf("unknown")
     val queueSize = mutableStateOf(0)
+    // Default OFF = send-now-or-discard. ON = bounded offline queue
+    // (5 items / 120s TTL, backlog dropped on fresh start).
+    val offlineQueueOn = mutableStateOf(false)
+    // Remote control channel said "pause": no /voice POSTs until it clears.
+    val pausedByControl = mutableStateOf(false)
 
     // ---- feedback (visual phase + haptics toggle) ----
-    // Compose-observable mirrors of the @Volatile flags in MainActivity, so the
-    // UI can actually recompose on them. Written on the main thread.
     val speaking = mutableStateOf(false)   // TTS is audibly talking
     val thinking = mutableStateOf(false)   // a POST to COSMOS is in flight
     val hapticsOn = mutableStateOf(true)   // settings toggle, persisted
@@ -103,10 +139,22 @@ class AppState {
     // Settings toggle: force the built-in phone mic even when a Bluetooth
     // headset is connected (BT SCO narrowband mics wreck recognition).
     val phoneMicOn = mutableStateOf(true)
+
+    // ---- stream / session / speech ----
+    // The COSMOS stream every payload is tagged with (project/stream field).
+    val stream = mutableStateOf("plumbing")
+    // Server-side reply verbosity: "brief" | "normal" | "full".
+    val verbosity = mutableStateOf("normal")
+    // TTS rate multiplier, 0.5..2.0.
+    val speechRate = mutableStateOf(1.0f)
+
+    // Two-step CONTINUOUS opt-in: step 1 sets this, step 2 is the dialog's
+    // explicit confirm. Nothing else can enter CONTINUOUS.
+    val showContinuousConfirm = mutableStateOf(false)
 }
 
 /** The one visual phase the mic button + big label reflect. Priority when
- *  several are true at once (driving mode keeps the mic hot): SPEAKING >
+ *  several are true at once (continuous keeps the mic hot): SPEAKING >
  *  THINKING > LISTENING > IDLE. */
 enum class VoicePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
@@ -115,10 +163,8 @@ class MainActivity : ComponentActivity() {
     private val state = AppState()
 
     // Speech OUT. DEFAULT = sherpaTts, the bundled sherpa-onnx offline engine
-    // (Piper VITS voice) — speaks with ZERO device-TTS/Google dependency, so a
-    // stripped phone still talks. `tts` (android.speech.tts) is an OPTIONAL
-    // fallback used only while the bundled voice is downloading/loading, and
-    // only if a device engine actually exists (systemTtsOk).
+    // (Piper VITS voice). `tts` (android.speech.tts) is an OPTIONAL fallback
+    // used only while the bundled voice is downloading/loading.
     private var sherpaTts: TtsEngine? = null
     private var tts: TextToSpeech? = null
     @Volatile private var systemTtsOk = false
@@ -128,12 +174,21 @@ class MainActivity : ComponentActivity() {
     // Eyes-free haptic cues (tick / double-tick / buzz / confirm pulses).
     private lateinit var haptics: Haptics
 
-    // Offline queue: transcripts that failed to POST, flushed when signal returns.
+    // Offline queue (only fed when the offline-queue toggle is ON).
     private lateinit var queue: OfflineQueue
     @Volatile private var flushing = false
 
-    // Driving-mode background poll (/status every ~20s) + connectivity monitor.
+    // Stable per-install id, sent as client_id in every request and used by
+    // the control channel to address this phone.
+    private lateinit var clientId: String
+
+    // Network jobs (sends + flushes) live in their own scope so the
+    // authoritative STOP can cancel them without touching the UI scope.
+    private val netScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    // Continuous-mode background poll (/status every ~20s) + connectivity monitor.
     private var pollJob: Job? = null
+    private var controlJob: Job? = null
     private var connectivity: ConnectivityManager? = null
     private var netCallback: ConnectivityManager.NetworkCallback? = null
     private var lastServerUp: Boolean? = null
@@ -142,25 +197,47 @@ class MainActivity : ComponentActivity() {
     // currentUtteranceKind: "reply" | "confirm" | "cue" | "" (idle).
     @Volatile private var ttsSpeaking = false
     @Volatile private var currentUtteranceKind = ""
+    // Last normal reply, for SAY AGAIN.
+    @Volatile private var lastSpokenReply: String? = null
 
     // Client-side pending-confirm expiry: a stray "yes" minutes later must
     // never fire a stale nonce, even if the server would still accept it.
     private var confirmExpireJob: Job? = null
 
+    // T2T endpointing: watches for ~1s of silence after speech and closes the
+    // capture (Vosk's own final usually lands first; this is the belt).
+    private var endpointJob: Job? = null
+    @Volatile private var lastVoiceActivityMs = 0L
+
+    // Remote control "pause": drop sends until the flag clears.
+    @Volatile private var controlPaused = false
+
     // ==================== USER-INTENT MIC FLAG ====================
-    // true after the user taps STOP: the mic must STAY off. The driving-mode
-    // watchdog (restartMicIfNeeded) and its retry loop (scheduleMicRetry)
-    // NO-OP while this is set — a hard stop is a hard stop. Cleared ONLY by
-    // an explicit user start (MIC tap) or by turning driving mode on.
-    // This is the fix for the field bug where STOP was silently defeated:
-    // toggleMic() stopped the recognizer, then the watchdog restarted it,
-    // so the mic was effectively always-on and captured ambient speech.
-    @Volatile private var userPaused = false
+    // true after the user hits STOP (button, notification, spoken "stop", or
+    // remote mic_off): the mic must STAY off. Every watchdog / restart timer /
+    // deferred start NO-OPs while this is set — a hard stop is a hard stop.
+    // Cleared ONLY by an explicit user start (tap, hold, or the confirmed
+    // CONTINUOUS opt-in).
+    @Volatile private var userStopped = false
+
+    // What the user asked the mic to become when the permission prompt fired;
+    // consumed by the grant callback (the grant IS the user action).
+    private var pendingStart: MicState? = null
+
+    // True while the mic button is physically held (PTT). Guards the async
+    // engine-load path: if the finger lifted before the mic was ready, the
+    // deferred start must NOT open a mic nobody is holding.
+    @Volatile private var pttHeld = false
+
+    private val continuous: Boolean
+        get() = state.micState.value == MicState.CONTINUOUS
 
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            val target = pendingStart ?: MicState.LISTENING_T2T
+            pendingStart = null
             if (granted) {
-                startListening()
+                if (!userStopped) startListening(target)
             } else {
                 log("Mic permission denied — voice input is disabled until granted.")
             }
@@ -171,7 +248,13 @@ class MainActivity : ComponentActivity() {
 
         val prefs = getSharedPreferences("cosmos", Context.MODE_PRIVATE)
         state.baseUrl.value = prefs.getString("base_url", state.baseUrl.value) ?: state.baseUrl.value
-        state.token.value = prefs.getString("token", "") ?: ""
+        // BEARER IS MEMORY-ONLY: never persisted. Scrub any token an older
+        // build left in prefs.
+        if (prefs.contains("token")) prefs.edit().remove("token").apply()
+
+        clientId = prefs.getString("client_id", null) ?: UUID.randomUUID().toString().also {
+            prefs.edit().putString("client_id", it).apply()
+        }
 
         queue = OfflineQueue(prefs)
         state.queueSize.value = queue.size
@@ -180,6 +263,7 @@ class MainActivity : ComponentActivity() {
             log("OFFLINE QUEUE: dropped ${queue.droppedAtLoad} stale item(s) from a " +
                 "previous run — voice is ephemeral, old transcripts never replay.")
         }
+        state.offlineQueueOn.value = prefs.getBoolean("offline_queue_on", false)
 
         state.hapticsOn.value = prefs.getBoolean("haptics_on", true)
         haptics = Haptics(this)
@@ -190,26 +274,39 @@ class MainActivity : ComponentActivity() {
         // headset over A2DP.
         state.phoneMicOn.value = prefs.getBoolean("phone_mic", true)
 
+        state.stream.value = prefs.getString("stream", "plumbing") ?: "plumbing"
+        state.verbosity.value = prefs.getString("verbosity", "normal") ?: "normal"
+        state.speechRate.value = prefs.getFloat("speech_rate", 1.0f)
+
+        // Notification STOP action -> the same authoritative stop as the button.
+        VoiceService.onStopAction = { performStop("notification") }
+
         // Optional fallback engine only — absent on a stripped phone, and that
         // is fine: the bundled sherpa-onnx voice (prepareTtsVoice) is the default.
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 systemTtsOk = true
                 tts?.language = Locale.US
+                tts?.setSpeechRate(state.speechRate.value)
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                     override fun onStart(utteranceId: String?) {
                         ttsSpeaking = true
-                        runOnUiThread { state.speaking.value = true }
+                        runOnUiThread {
+                            state.speaking.value = true
+                            updateMicService()
+                        }
                     }
 
                     override fun onDone(utteranceId: String?) {
                         ttsSpeaking = false
                         currentUtteranceKind = ""
-                        // DRIVING: the recognizer must never silently stay dead
-                        // after we finish talking — kick it back on if it died.
+                        // CONTINUOUS: the recognizer must never silently stay
+                        // dead after we finish talking — kick it back on if it
+                        // died. (No-op in every other state, and while stopped.)
                         runOnUiThread {
                             state.speaking.value = false
-                            if (state.drivingMode.value) restartMicIfNeeded()
+                            updateMicService()
+                            if (continuous) restartMicIfNeeded()
                         }
                     }
 
@@ -217,7 +314,10 @@ class MainActivity : ComponentActivity() {
                     override fun onError(utteranceId: String?) {
                         ttsSpeaking = false
                         currentUtteranceKind = ""
-                        runOnUiThread { state.speaking.value = false }
+                        runOnUiThread {
+                            state.speaking.value = false
+                            updateMicService()
+                        }
                     }
                 })
             }
@@ -225,6 +325,7 @@ class MainActivity : ComponentActivity() {
 
         registerNetworkMonitor()
         prepareTtsVoice()
+        startControlPolling()
 
         state.modelStatus.value = if (ModelManager.isReady(this)) "ready (not loaded)" else "not downloaded"
 
@@ -232,24 +333,41 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 AppScreen(
                     state = state,
+                    buildName = BuildConfig.VERSION_NAME,
                     onConnect = { testConnection() },
-                    onMic = { toggleMic() },
+                    onMicTap = { onMicTap() },
+                    onPttStart = { onPttStart() },
+                    onPttRelease = { onPttRelease() },
+                    onStop = { performStop("STOP button") },
                     onConfirm = { confirmPending() },
                     onSave = { saveSettings() },
-                    onDriving = { setDrivingMode(!state.drivingMode.value) },
+                    onContinuousRequest = { requestContinuous() },
+                    onContinuousConfirm = { confirmContinuous() },
+                    onContinuousDismiss = { state.showContinuousConfirm.value = false },
                     onHaptics = { on -> setHaptics(on) },
                     onDictate = { setDictateMode(!state.dictateMode.value) },
-                    onPhoneMic = { on -> setPhoneMic(on) }
+                    onPhoneMic = { on -> setPhoneMic(on) },
+                    onOfflineQueue = { on -> setOfflineQueue(on) },
+                    onStream = { s -> setStream(s) },
+                    onBootUp = { bootUp() },
+                    onNewSession = { newSession() },
+                    onVerbosity = { v -> setVerbosity(v) },
+                    onSpeechRate = { r -> setSpeechRate(r) },
+                    onSayAgain = { sayAgain() }
                 )
             }
         }
 
-        log("COSMOS Voice v0.1 — set the server URL, tap Connect, then tap MIC. " +
-            "Tap DRIVING MODE (or say \"driving mode on\") for hands-free.")
+        log("COSMOS Voice v${BuildConfig.VERSION_NAME} — tap Talk for one utterance, " +
+            "hold for push-to-talk. STOP always wins.")
     }
 
     override fun onDestroy() {
+        VoiceService.onStopAction = null
         pollJob?.cancel()
+        controlJob?.cancel()
+        endpointJob?.cancel()
+        netScope.cancel()
         netCallback?.let { cb ->
             try {
                 connectivity?.unregisterNetworkCallback(cb)
@@ -265,13 +383,71 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
     }
 
-    /** The mic foreground service runs while the mic is on OR driving mode is
-     *  active (driving mode restarts the mic on its own, so the service must
-     *  outlive transient listening=false moments). */
+    // ==================== AUTHORITATIVE STOP ====================
+
+    /**
+     * From ANY state -> OFF. Kills the recognizer, the TTS, every in-flight
+     * HTTP request, and the local queue; sets userStopped so every watchdog,
+     * retry timer, and deferred start is a NO-OP until the user explicitly
+     * starts the mic again. Nothing can override this.
+     */
+    private fun performStop(source: String) {
+        userStopped = true
+        pttHeld = false
+        pendingStart = null
+        endpointJob?.cancel()
+        pollJob?.cancel()
+        pollJob = null
+        confirmExpireJob?.cancel()
+        state.pendingConfirmId.value = null
+        state.pendingTranscript.value = null
+
+        // Mic + recognizer.
+        voice?.stop()
+        state.micState.value = MicState.OFF
+        state.partial.value = ""
+
+        // Voice out.
+        stopSpeaking()
+        ttsSpeaking = false
+        currentUtteranceKind = ""
+        state.speaking.value = false
+
+        // In-flight HTTP: sever sockets AND cancel the coroutines around them.
+        CosmosClient.abortAll()
+        netScope.coroutineContext.cancelChildren()
+        flushing = false
+        state.thinking.value = false
+
+        // Local queue: a hard stop empties the backlog — nothing replays later.
+        val cleared = queue.clear()
+        state.queueSize.value = 0
+
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        updateMicService()
+        haptics.alert()
+        log("STOP ($source) — mic OFF, speech stopped, requests aborted" +
+            (if (cleared > 0) ", $cleared queued item(s) discarded" else "") +
+            ". Nothing restarts until you start it.")
+    }
+
+    /** The mic foreground service runs ONLY while actually capturing or
+     *  speaking; its notification names the state and carries a STOP action.
+     *  It can never keep the mic alive past STOP — performStop turns both
+     *  conditions false and this tears the service down. */
     private fun updateMicService() {
-        val needed = state.listening.value || state.drivingMode.value
+        val st = state.micState.value
+        val speaking = state.speaking.value
+        val needed = st != MicState.OFF || speaking
+        val label = when {
+            st == MicState.CONTINUOUS -> "LIVE — listening continuously. Tap STOP to end."
+            st == MicState.LISTENING_PTT -> "Listening (hold-to-talk)"
+            st == MicState.LISTENING_T2T -> "Listening (one utterance)"
+            speaking -> "Speaking"
+            else -> ""
+        }
         try {
-            if (needed) VoiceService.start(this) else VoiceService.stop(this)
+            if (needed) VoiceService.start(this, label) else VoiceService.stop(this)
         } catch (e: Exception) {
             // API 31+ refuses an FGS start from the background — the mic still
             // works while the activity is up; log it instead of crashing.
@@ -301,23 +477,25 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 val engine = TtsEngine(
-                    // Same contract the android.speech.tts listener had: the
-                    // flags drive the confirm echo-guard, and onDone kicks the
-                    // driving-mode mic back on after we finish talking.
                     onStart = { _ ->
                         ttsSpeaking = true
-                        runOnUiThread { state.speaking.value = true }
+                        runOnUiThread {
+                            state.speaking.value = true
+                            updateMicService()
+                        }
                     },
                     onDone = { _ ->
                         ttsSpeaking = false
                         currentUtteranceKind = ""
                         runOnUiThread {
                             state.speaking.value = false
-                            if (state.drivingMode.value) restartMicIfNeeded()
+                            updateMicService()
+                            if (continuous) restartMicIfNeeded()
                         }
                     }
                 )
                 engine.init(this@MainActivity)
+                engine.speed = state.speechRate.value
                 withContext(Dispatchers.Main) {
                     sherpaTts = engine
                     state.ttsStatus.value = "ready (offline)"
@@ -345,19 +523,17 @@ class MainActivity : ComponentActivity() {
      *              current speech instead of clobbering it
      * add=true queues behind current speech regardless of kind (used when
      * flushing the offline queue so results read out in order).
-     *
-     * DEFAULT engine: the bundled sherpa-onnx voice (offline, no device engine
-     * needed). android.speech.tts is only the stand-in while the voice model
-     * is still downloading, and only when the device actually has an engine.
      */
     private fun speak(text: String, kind: String = "reply", add: Boolean = false) {
         val flush = !(add || kind == "cue") // reply/confirm interrupt; cue/add queue behind
+        if (kind == "reply") lastSpokenReply = text
 
         val engine = sherpaTts
         if (engine != null && engine.isReady) {
             currentUtteranceKind = kind
             ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
             state.speaking.value = true
+            updateMicService()
             engine.speak(text, "$kind-${System.currentTimeMillis()}", flush)
             return
         }
@@ -368,6 +544,7 @@ class MainActivity : ComponentActivity() {
             currentUtteranceKind = kind
             ttsSpeaking = true // optimistic; confirmed by onStart, cleared by onDone
             state.speaking.value = true
+            updateMicService()
             val r = t.speak(text, mode, null, "$kind-${System.currentTimeMillis()}")
             if (r != TextToSpeech.SUCCESS) {
                 // Engine rejected it: clear the flags immediately, otherwise the
@@ -375,6 +552,7 @@ class MainActivity : ComponentActivity() {
                 ttsSpeaking = false
                 currentUtteranceKind = ""
                 state.speaking.value = false
+                updateMicService()
             }
             return
         }
@@ -389,43 +567,66 @@ class MainActivity : ComponentActivity() {
         tts?.stop()
     }
 
-    /** Short spoken status cue — driving mode only (silent at the desk). */
-    private fun cue(text: String) {
-        if (state.drivingMode.value) speak(text, kind = "cue")
-    }
-
-    // ---------- driving mode ----------
-
-    private fun setDrivingMode(on: Boolean) {
-        if (state.drivingMode.value == on) {
-            if (on) speak("Driving mode is already on.")
-            return
-        }
-        state.drivingMode.value = on
-        if (on) {
-            // Eyes-free: screen stays on so Android never pauses us mid-drive,
-            // and the mic foreground service keeps recognition alive even when
-            // the app does go off-screen (Maps, screen blank, pocket).
-            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            log("DRIVING MODE ON — hands-free, continuous listening, everything spoken.")
-            speak("Driving mode on.")
-            userPaused = false // explicit opt-in to continuous listening
-            startPolling()
-            ensureMicOn()
-        } else {
-            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-            pollJob?.cancel()
-            pollJob = null
-            log("DRIVING MODE OFF.")
-            speak("Driving mode off.")
-            // Mic stays as-is for this moment; outside driving mode it is
-            // TAP-TO-TALK — the next final stops it (see stopAfterUtterance).
-        }
+    /** Barge-in: the user acted (tap / hold / speech) while TTS was talking —
+     *  silence it immediately. Exception handled by callers: the confirm
+     *  prompt is never barged (echo guard). */
+    private fun bargeInStopTts() {
+        if (!ttsSpeaking) return
+        stopSpeaking()
+        ttsSpeaking = false
+        currentUtteranceKind = ""
+        state.speaking.value = false
         updateMicService()
     }
 
-    /** Poll /status every ~20s while driving: detects signal coming back and
-     *  flushes the offline queue. Cancelled when driving mode turns off. */
+    /** Short spoken status cue — continuous mode only (silent at the desk). */
+    private fun cue(text: String) {
+        if (continuous) speak(text, kind = "cue")
+    }
+
+    /** Re-speak the last normal reply (SAY AGAIN, button or voice). */
+    private fun sayAgain() {
+        val last = lastSpokenReply
+        if (last.isNullOrBlank()) {
+            log("(nothing to say again)")
+            return
+        }
+        log("(say again)")
+        speak(last)
+    }
+
+    // ---------- CONTINUOUS (two-step opt-in) ----------
+
+    /** Step 1: the user asked for continuous listening. Nothing turns on yet —
+     *  the confirm dialog (step 2) is the only way in. Also reachable by
+     *  voice ("driving mode on"), which still requires the on-screen confirm. */
+    private fun requestContinuous() {
+        if (continuous) return
+        state.showContinuousConfirm.value = true
+    }
+
+    /** Step 2: the explicit confirm. This is the ONLY entry to CONTINUOUS. */
+    private fun confirmContinuous() {
+        state.showContinuousConfirm.value = false
+        if (continuous) return
+        // End any one-shot capture cleanly first so the state moves OFF ->
+        // CONTINUOUS through the front door.
+        if (state.micState.value != MicState.OFF) {
+            endpointJob?.cancel()
+            voice?.stop()
+            state.micState.value = MicState.OFF
+            state.partial.value = ""
+        }
+        userStopped = false // explicit opt-in re-arms the mic
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        log("CONTINUOUS LISTENING ON — the red LIVE banner stays up; tap STOP to end.")
+        speak("Continuous listening on.")
+        startPolling()
+        ensureMicOn(MicState.CONTINUOUS)
+    }
+
+    /** Poll /status every ~20s while continuous: detects signal coming back
+     *  and flushes the offline queue. Cancelled by STOP. */
     private fun startPolling() {
         pollJob?.cancel()
         pollJob = lifecycleScope.launch {
@@ -470,7 +671,8 @@ class MainActivity : ComponentActivity() {
             val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
                     // Network is back — verify the SERVER is actually reachable
-                    // (a bar of LTE is not a reachable COSMOS) and flush.
+                    // (a bar of LTE is not a reachable COSMOS) and flush. This
+                    // NEVER touches the mic.
                     runOnUiThread { lifecycleScope.launch { pingAndFlush() } }
                 }
 
@@ -485,23 +687,108 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // ---------- CONTROL CHANNEL (remote kill) ----------
+
+    /**
+     * Poll GET /api/v1/control?client_id=<id> every ~3s, forever, and obey
+     * {mic_off, pause, clear_queue} IMMEDIATELY. Fail-safe: any fetch error
+     * does NOTHING — the channel can only turn things off, never on.
+     */
+    private fun startControlPolling() {
+        controlJob?.cancel()
+        controlJob = lifecycleScope.launch {
+            while (isActive) {
+                delay(3_000)
+                val base = state.baseUrl.value.trim().trimEnd('/')
+                if (base.isBlank()) continue
+                val resp = withContext(Dispatchers.IO) {
+                    try {
+                        ControlClient.fetch(base, state.token.value.trim(), clientId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        null // fail-safe: no response -> no action
+                    }
+                } ?: continue
+                if (resp.has("http_status")) continue // error body -> no action
+
+                if (resp.optBoolean("mic_off", false)) {
+                    if (state.micState.value != MicState.OFF || state.speaking.value ||
+                        state.thinking.value || queue.size > 0
+                    ) {
+                        performStop("remote control mic_off")
+                    }
+                }
+                if (resp.optBoolean("clear_queue", false) && queue.size > 0) {
+                    val n = queue.clear()
+                    state.queueSize.value = 0
+                    log("CONTROL: cleared $n queued item(s).")
+                }
+                val pause = resp.optBoolean("pause", false)
+                if (pause != controlPaused) {
+                    controlPaused = pause
+                    state.pausedByControl.value = pause
+                    log(if (pause) "CONTROL: PAUSED — nothing is sent until the server clears it."
+                        else "CONTROL: pause cleared — sending allowed again.")
+                }
+            }
+        }
+    }
+
     // ---------- settings ----------
 
     private fun saveSettings() {
+        // Bearer token: MEMORY-ONLY, deliberately not persisted.
         getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
             .putString("base_url", state.baseUrl.value.trim())
-            .putString("token", state.token.value.trim())
             .apply()
+    }
+
+    private fun setStream(s: String) {
+        state.stream.value = s
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putString("stream", s)
+            .apply()
+        log("STREAM: $s — every payload is tagged with it.")
+    }
+
+    private fun setVerbosity(v: String) {
+        state.verbosity.value = v
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putString("verbosity", v)
+            .apply()
+        log("VERBOSITY: $v")
+    }
+
+    private fun setSpeechRate(r: Float) {
+        state.speechRate.value = r
+        sherpaTts?.speed = r
+        tts?.setSpeechRate(r)
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putFloat("speech_rate", r)
+            .apply()
+    }
+
+    private fun setOfflineQueue(on: Boolean) {
+        state.offlineQueueOn.value = on
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putBoolean("offline_queue_on", on)
+            .apply()
+        if (!on) {
+            val n = queue.clear()
+            state.queueSize.value = 0
+            if (n > 0) log("Offline queue OFF — $n pending item(s) discarded.")
+        }
+        log(if (on) "OFFLINE QUEUE ON — up to ${OfflineQueue.MAX_ITEMS} items, " +
+                "${OfflineQueue.MAX_AGE_MS / 1000}s TTL."
+            else "SEND-NOW-OR-DISCARD — a failed send is dropped with a log.")
     }
 
     /**
      * Route audio INPUT to the built-in phone mic when the "Use phone mic"
      * toggle is ON (default): make sure Bluetooth SCO is DOWN before the
-     * recognizer opens its AudioRecord. An AudioRecord on the MIC source only
-     * routes to a BT headset mic when SCO is active, so with SCO off the
-     * input is the device mic while BT keeps playing TTS output over A2DP.
-     * Toggle OFF = leave the system default routing alone (BT mic allowed).
-     * Called right before every recognizer start; best-effort.
+     * recognizer opens its AudioRecord. Called right before every recognizer
+     * start; best-effort.
      */
     private fun applyMicRoute() {
         if (!state.phoneMicOn.value) return
@@ -528,7 +815,7 @@ class MainActivity : ComponentActivity() {
             .apply()
         log(if (on) "PHONE MIC — Bluetooth mic ignored (BT audio out still works)."
             else "SYSTEM MIC ROUTING — Bluetooth mic allowed.")
-        if (state.listening.value) restartRecognizer()
+        if (state.micState.value != MicState.OFF) restartRecognizer()
     }
 
     /** Haptics on/off toggle — persisted, default ON. */
@@ -578,10 +865,9 @@ class MainActivity : ComponentActivity() {
 
     // ---------- voice model ----------
 
-    /** resumeListening=true: after the download completes, go straight back
-     *  into listening (first-run recovery — the user asked for the mic; the
-     *  download was just in the way). */
-    private fun downloadModel(resumeListening: Boolean = false) {
+    /** Model download NEVER auto-starts the mic afterwards — the user taps
+     *  Talk again when it lands (the invariant beats the convenience). */
+    private fun downloadModel() {
         val st = state.modelStatus.value
         if (st == "downloading" || st == "unzipping") return
         state.modelStatus.value = "downloading"
@@ -597,12 +883,7 @@ class MainActivity : ComponentActivity() {
                 }
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "ready (not loaded)"
-                    if (resumeListening || state.drivingMode.value) {
-                        log("Voice model ready — resuming listening.")
-                        startListening()
-                    } else {
-                        log("Voice model ready. Tap MIC to start.")
-                    }
+                    log("Voice model ready. Tap Talk to start.")
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -625,20 +906,18 @@ class MainActivity : ComponentActivity() {
                 val engine = VoiceEngine(
                     onPartial = { p ->
                         runOnUiThread {
+                            if (p.isNotBlank() && p != state.partial.value) {
+                                lastVoiceActivityMs = System.currentTimeMillis()
+                            }
                             state.partial.value = p
                             // ================== BARGE-IN ==================
                             // The user started talking while we were talking:
                             // stop the TTS so they can be heard. Exception:
                             // while the CONFIRM prompt is playing we do NOT
-                            // barge-in — without guaranteed echo cancellation
-                            // the phone can hear its own prompt, and cutting
-                            // the prompt off on our own echo (then treating
-                            // that echo as a "no") would cancel real actions.
+                            // barge-in (echo guard — the phone can hear its
+                            // own prompt).
                             if (p.isNotBlank() && ttsSpeaking && currentUtteranceKind != "confirm") {
-                                stopSpeaking()
-                                ttsSpeaking = false
-                                currentUtteranceKind = ""
-                                state.speaking.value = false
+                                bargeInStopTts()
                             }
                         }
                     },
@@ -646,17 +925,20 @@ class MainActivity : ComponentActivity() {
                     onErr = { msg ->
                         runOnUiThread {
                             log("VOICE ERROR: $msg")
-                            if (state.drivingMode.value) {
-                                // DRIVING: never let the recognizer die silently.
-                                // Tear down, wait a beat, restart.
+                            if (continuous && !userStopped) {
+                                // CONTINUOUS: never let the recognizer die
+                                // silently. Tear down, wait a beat, restart.
                                 voice?.stop()
-                                state.listening.value = false
                                 lifecycleScope.launch {
                                     delay(1_000)
                                     restartMicIfNeeded()
                                 }
                             } else {
-                                state.listening.value = false
+                                endpointJob?.cancel()
+                                voice?.stop()
+                                state.micState.value = MicState.OFF
+                                state.partial.value = ""
+                                updateMicService()
                             }
                         }
                     }
@@ -671,9 +953,9 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "error: ${e.message?.take(80)}"
                     log("MODEL LOAD FAILED: ${e.message}")
-                    if (state.drivingMode.value) {
-                        // DRIVING: a load error must not park the mic forever —
-                        // retry the whole recovery path in a few seconds.
+                    if (continuous && !userStopped) {
+                        // CONTINUOUS opt-in is still live: retry in a few
+                        // seconds (STOP makes this a no-op).
                         lifecycleScope.launch {
                             delay(5_000)
                             restartMicIfNeeded()
@@ -705,150 +987,222 @@ class MainActivity : ComponentActivity() {
                 else "COMMAND mode — grammar-constrained recognition.")
             if (on) cue("Dictating.") else cue("Commands.")
         }
-        if (state.listening.value) restartRecognizer()
+        if (state.micState.value != MicState.OFF) restartRecognizer()
     }
 
-    /** Rebuild the live recognizer for the current mode/mic-route settings. */
+    /** Rebuild the live recognizer for the current mode/mic-route settings,
+     *  keeping the current mic state. */
     private fun restartRecognizer() {
         val v = voice ?: return
+        if (state.micState.value == MicState.OFF) return
         v.stop()
         try {
             applyMicRoute()
             v.start(currentGrammar())
-            state.listening.value = true
         } catch (e: Exception) {
             log("MIC RESTART FAILED: ${e.message}")
-            state.listening.value = false
-            if (state.drivingMode.value) scheduleMicRetry("recognizer rebuild failed")
-        }
-    }
-
-    // ---------- mic ----------
-
-    private fun toggleMic() {
-        // Tap barge-in: a deliberate mic tap silences the TTS immediately —
-        // it must never keep talking over the user (or pile up repeats).
-        if (ttsSpeaking) {
-            stopSpeaking()
-            ttsSpeaking = false
-            currentUtteranceKind = ""
-            state.speaking.value = false
-        }
-        if (state.listening.value) {
-            // STOP IS AUTHORITATIVE. Set the user-intent flag FIRST so no
-            // watchdog/retry that is already in flight can win the race,
-            // then drop driving mode too — continuous listening is an
-            // explicit opt-in, and a hard stop ends it.
-            userPaused = true
-            if (state.drivingMode.value) setDrivingMode(false)
-            voice?.stop()
-            state.listening.value = false
-            state.partial.value = ""
-            log("Mic off — stays off until you tap MIC.")
+            endpointJob?.cancel()
+            state.micState.value = MicState.OFF
             updateMicService()
-            return
+            if (continuous) scheduleMicRetry("recognizer rebuild failed")
         }
-        userPaused = false // explicit user start re-arms the mic
-        ensureMicOn()
     }
 
-    /** TAP-TO-TALK — the SAFE DEFAULT outside driving mode: one MIC tap
-     *  listens for ONE utterance; when its final arrives the mic stops and
-     *  the app returns to idle, so ambient conversation is never continuously
-     *  captured. Continuous always-on listening exists ONLY as the explicit
-     *  DRIVING MODE opt-in (this is a no-op while driving mode is on). */
-    private fun stopAfterUtterance() {
-        if (state.drivingMode.value) return
-        if (!state.listening.value) return
-        voice?.stop()
-        state.listening.value = false
+    // ---------- mic (user gestures) ----------
+
+    /**
+     * TAP — the default gesture:
+     *   OFF        -> LISTENING_T2T (one utterance, then auto-OFF)
+     *   T2T        -> endpoint NOW (Vosk flushes its final -> sent) and OFF
+     *   PTT        -> no-op (the release handles it)
+     *   CONTINUOUS -> barge-in only (STOP is the exit, and it is right there)
+     * Any tap silences the TTS (barge-in) first.
+     */
+    private fun onMicTap() {
+        bargeInStopTts()
+        when (state.micState.value) {
+            MicState.OFF -> {
+                userStopped = false // explicit user start re-arms the mic
+                ensureMicOn(MicState.LISTENING_T2T)
+            }
+            MicState.LISTENING_T2T -> {
+                endpointJob?.cancel()
+                voice?.stop() // flushes the final -> onFinalTranscript sends it
+                if (state.micState.value == MicState.LISTENING_T2T) {
+                    state.micState.value = MicState.OFF
+                    state.partial.value = ""
+                    updateMicService()
+                }
+                log("(endpointed by tap)")
+            }
+            MicState.LISTENING_PTT -> { /* release handles it */ }
+            MicState.CONTINUOUS -> { /* barge-in done above; STOP exits */ }
+        }
+    }
+
+    /** HOLD (push-to-talk): press opens the mic. Fires from a long-press on
+     *  the mic button. A hold during T2T upgrades the capture to PTT
+     *  semantics (release = send). */
+    private fun onPttStart() {
+        when (state.micState.value) {
+            MicState.OFF -> {
+                bargeInStopTts()
+                userStopped = false
+                pttHeld = true
+                ensureMicOn(MicState.LISTENING_PTT)
+            }
+            MicState.LISTENING_T2T -> {
+                endpointJob?.cancel()
+                pttHeld = true
+                state.micState.value = MicState.LISTENING_PTT
+                updateMicService()
+                log("(hold — release to send)")
+            }
+            else -> { /* PTT already, or CONTINUOUS — nothing */ }
+        }
+    }
+
+    /** RELEASE (push-to-talk): endpoint and send. */
+    private fun onPttRelease() {
+        pttHeld = false
+        if (state.micState.value != MicState.LISTENING_PTT) return
+        voice?.stop() // flushes the final -> onFinalTranscript sends it
+        state.micState.value = MicState.OFF
         state.partial.value = ""
         updateMicService()
-        log("(mic idle — tap MIC to talk again)")
+        log("(released — sending)")
     }
 
-    /** Turn the mic on if it is off, requesting permission when needed. */
-    private fun ensureMicOn() {
-        if (state.listening.value) return
+    /** Turn the mic on into [target], requesting permission when needed.
+     *  ONLY reachable from an explicit user action. */
+    private fun ensureMicOn(target: MicState) {
+        if (state.micState.value != MicState.OFF) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
+            pendingStart = target
             micPermission.launch(Manifest.permission.RECORD_AUDIO)
             return
         }
-        startListening()
+        startListening(target)
     }
 
-    private fun startListening() {
+    private fun startListening(target: MicState) {
+        if (target == MicState.OFF) return
+        if (userStopped) return // a hard stop is a hard stop
         if (!ModelManager.isReady(this)) {
-            // First run: the user asked to listen — resume automatically once
-            // the model lands instead of making them tap MIC a second time.
-            downloadModel(resumeListening = true)
+            // First run: get the model; the user taps Talk again when ready
+            // (the mic NEVER auto-starts, download completion included).
+            downloadModel()
             return
         }
         ensureEngineLoaded {
+            if (userStopped) return@ensureEngineLoaded // STOP won the race
+            if (target == MicState.LISTENING_PTT && !pttHeld) {
+                // The finger lifted while the engine was loading — never open
+                // a mic nobody is holding.
+                log("(hold released before the mic was ready — nothing captured)")
+                return@ensureEngineLoaded
+            }
             try {
                 applyMicRoute()
                 voice?.start(currentGrammar())
-                state.listening.value = true
+                state.micState.value = target
                 updateMicService()
                 haptics.micStart() // short tick: "I'm hearing you" — no glance needed
+                if (target == MicState.LISTENING_T2T) armT2tEndpoint()
                 log(
-                    if (state.drivingMode.value)
-                        "Listening continuously (DRIVING MODE)... tap STOP to end."
-                    else
-                        "Listening (${if (state.dictateMode.value) "DICTATE" else "COMMAND"} mode)... " +
-                            "speak, pause to send — mic stops after one utterance."
+                    when (target) {
+                        MicState.CONTINUOUS ->
+                            "Listening continuously (LIVE)... tap STOP to end."
+                        MicState.LISTENING_PTT ->
+                            "Listening (hold-to-talk)... release to send."
+                        else ->
+                            "Listening (${if (state.dictateMode.value) "DICTATE" else "COMMAND"})... " +
+                                "speak, pause to send — one utterance, then off."
+                    }
                 )
-                cue("Listening.")
+                if (target == MicState.CONTINUOUS) cue("Listening.")
             } catch (e: Exception) {
                 log("MIC START FAILED: ${e.message}")
-                state.listening.value = false
+                state.micState.value = MicState.OFF
+                updateMicService()
             }
         }
     }
 
-    /** Driving-mode watchdog: if the recognizer is not running, restart it.
+    /** T2T auto-endpoint: Vosk's own final (on end of speech) normally closes
+     *  the capture; this watchdog is the belt — ~1s of silence after speech
+     *  forces the endpoint, and hearing nothing at all times out. */
+    private fun armT2tEndpoint() {
+        endpointJob?.cancel()
+        lastVoiceActivityMs = System.currentTimeMillis()
+        endpointJob = lifecycleScope.launch {
+            var sawSpeech = false
+            while (isActive && state.micState.value == MicState.LISTENING_T2T) {
+                delay(200)
+                if (state.partial.value.isNotBlank()) sawSpeech = true
+                val idleMs = System.currentTimeMillis() - lastVoiceActivityMs
+                if (sawSpeech && idleMs >= T2T_SILENCE_MS) {
+                    voice?.stop() // flush final -> onFinalTranscript sends it
+                    if (state.micState.value == MicState.LISTENING_T2T) {
+                        state.micState.value = MicState.OFF
+                        state.partial.value = ""
+                        updateMicService()
+                    }
+                    break
+                }
+                if (!sawSpeech && idleMs >= T2T_MAX_WAIT_MS) {
+                    voice?.stop()
+                    if (state.micState.value == MicState.LISTENING_T2T) {
+                        state.micState.value = MicState.OFF
+                        state.partial.value = ""
+                        updateMicService()
+                    }
+                    log("(heard nothing — mic off)")
+                    break
+                }
+            }
+        }
+    }
+
+    /** CONTINUOUS watchdog: if the recognizer is not running, restart it.
      *  Called after every TTS utterance finishes and after voice errors.
-     *  Retries every 2s while driving mode stays on; stops retrying the
-     *  moment driving mode turns off. */
+     *  A NO-OP in every other state and, always, while userStopped is set —
+     *  this is a keep-alive for the explicit opt-in, never an auto-start. */
     private fun restartMicIfNeeded() {
-        if (userPaused) return // the user said STOP — the mic stays off
-        if (!state.drivingMode.value) return
+        if (userStopped) return // the user said STOP — the mic stays off
+        if (state.micState.value != MicState.CONTINUOUS) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) return
         val v = voice
         if (v == null || !v.isLoaded) {
-            // The engine never loaded (or an earlier load failed). The old
-            // code early-returned here PERMANENTLY — a single model-load error
-            // left driving mode deaf until app restart. Re-run the full
-            // recovery path instead: download if needed, then load and start.
             if (!ModelManager.isReady(this)) {
-                downloadModel(resumeListening = true)
-            } else {
-                ensureEngineLoaded {
-                    try {
-                        applyMicRoute()
-                        voice?.start(currentGrammar())
-                        state.listening.value = true
-                        updateMicService()
-                        log("(mic auto-restarted after model load)")
-                    } catch (e: Exception) {
-                        scheduleMicRetry("MIC RESTART FAILED: ${e.message}")
-                    }
+                // Model vanished mid-session: exit continuous instead of
+                // looping a download — the user restarts when it is back.
+                log("CONTINUOUS: voice model missing — going OFF.")
+                state.micState.value = MicState.OFF
+                updateMicService()
+                return
+            }
+            ensureEngineLoaded {
+                if (userStopped || state.micState.value != MicState.CONTINUOUS) return@ensureEngineLoaded
+                try {
+                    applyMicRoute()
+                    voice?.start(currentGrammar())
+                    updateMicService()
+                    log("(mic auto-restarted after model load)")
+                } catch (e: Exception) {
+                    scheduleMicRetry("MIC RESTART FAILED: ${e.message}")
                 }
             }
             return
         }
-        if (v.isRunning) {
-            state.listening.value = true
-            return
-        }
+        if (v.isRunning) return
         try {
             applyMicRoute()
             v.start(currentGrammar())
-            state.listening.value = true
             log("(mic auto-restarted)")
         } catch (e: Exception) {
             scheduleMicRetry("MIC RESTART FAILED: ${e.message}")
@@ -856,7 +1210,7 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scheduleMicRetry(msg: String) {
-        if (userPaused) return // the user said STOP — no retry loop
+        if (userStopped) return // the user said STOP — no retry loop
         log("$msg — retrying in 2s")
         lifecycleScope.launch {
             delay(2_000)
@@ -865,6 +1219,18 @@ class MainActivity : ComponentActivity() {
     }
 
     // ---------- transcript handling ----------
+
+    /** One-shot capture done (T2T/PTT): return to OFF. No-op in CONTINUOUS. */
+    private fun stopAfterUtterance() {
+        val st = state.micState.value
+        if (st == MicState.CONTINUOUS || st == MicState.OFF) return
+        endpointJob?.cancel()
+        voice?.stop()
+        state.micState.value = MicState.OFF
+        state.partial.value = ""
+        updateMicService()
+        log("(mic idle — tap Talk to speak again)")
+    }
 
     private fun onFinalTranscript(text: String) {
         state.partial.value = ""
@@ -879,22 +1245,10 @@ class MainActivity : ComponentActivity() {
         val norm = VoiceGrammar.normalize(raw)
 
         // ================= PENDING-CONFIRM STATE MACHINE =================
-        // Two states, keyed off state.pendingConfirmId:
-        //
-        //   IDLE            (pendingConfirmId == null)
-        //     a final transcript is a NEW command -> falls through below.
-        //
-        //   AWAITING_YESNO  (pendingConfirmId != null)
-        //     the next final is the ANSWER to "Confirm: ...?" and is NEVER
-        //     treated as a new command.
-        //       yes-words ("yes"/"confirm"/"do it"/...) -> re-POST the original
-        //           transcript with the single-use confirm_id nonce.
-        //       anything else -> drop the nonce and say "Cancelled."
-        //
-        // Echo guard: a final that COMPLETES while the confirm prompt is still
-        // being spoken is almost certainly the phone hearing its own prompt
-        // (no AEC guarantee on the VOSK mic path). Acting on it would cancel —
-        // or worse, confirm — on garbage, so it is discarded.
+        // AWAITING_YESNO: the next final is the ANSWER to "Confirm: ...?" and
+        // is NEVER treated as a new command. Echo guard: a final completing
+        // while the confirm prompt is still speaking is the phone hearing its
+        // own prompt — discarded.
         // =================================================================
         if (state.pendingConfirmId.value != null) {
             if (ttsSpeaking && currentUtteranceKind == "confirm") {
@@ -911,16 +1265,34 @@ class MainActivity : ComponentActivity() {
                 log("CANCELLED (heard: \"$raw\"). Nonce dropped.")
                 speak("Cancelled.")
             }
-            stopAfterUtterance() // confirm answered — tap-to-talk goes idle
+            stopAfterUtterance() // confirm answered — one-shot capture goes idle
+            return
+        }
+
+        // Spoken authoritative STOP — works in every mode, before anything
+        // else can consume the word.
+        if (VoiceGrammar.isStop(norm)) {
+            log("YOU: $raw")
+            performStop("voice")
             return
         }
 
         log("YOU: $raw")
 
+        // Local voice controls that never leave the phone.
+        if (VoiceGrammar.isSayAgain(norm)) {
+            sayAgain()
+            stopAfterUtterance()
+            return
+        }
+        if (VoiceGrammar.isNewSession(norm)) {
+            newSession()
+            stopAfterUtterance()
+            return
+        }
+
         // ===================== RECOGNITION MODE SWITCH =====================
         // DICTATE mode: this final IS the dictated utterance (open decode).
-        // "done" ends dictation without sending; anything else is sent as-is
-        // and the recognizer auto-reverts to grammar-constrained COMMAND mode.
         if (state.dictateMode.value) {
             if (VoiceGrammar.isDictateDone(norm)) {
                 stopAfterUtterance() // stop FIRST so setDictateMode does not rebuild a live recognizer
@@ -928,88 +1300,102 @@ class MainActivity : ComponentActivity() {
                 return
             }
             send(raw, null, quiet = false)
-            stopAfterUtterance() // one open utterance, then idle (tap-to-talk)
+            stopAfterUtterance() // one open utterance, then idle
             setDictateMode(false) // back to commands for the next tap
             return
         }
-        // COMMAND mode: a bare "ask"/"dictate"/"start dictation" opens the
-        // recognizer for free speech (the grammar blocks arbitrary text, so
-        // the switch has to be explicit).
+        // COMMAND mode: a bare "ask"/"dictate" opens the recognizer for free
+        // speech (the grammar blocks arbitrary text, so the switch is explicit).
         if (VoiceGrammar.isDictateStart(norm)) {
             setDictateMode(true)
             return
         }
 
-        // Voice control of driving mode itself ("driving mode on/off").
+        // Voice control of continuous mode. ON still requires the on-screen
+        // confirm (two-step opt-in, no exceptions); OFF is a full STOP.
         if (VoiceGrammar.isDrivingOff(norm)) {
-            setDrivingMode(false)
-            stopAfterUtterance() // leaving continuous mode -> idle, not hot mic
+            performStop("voice (driving mode off)")
             return
         }
         if (VoiceGrammar.isDrivingOn(norm)) {
-            setDrivingMode(true)
+            requestContinuous()
+            speak("Confirm continuous listening on the screen.")
+            stopAfterUtterance()
             return
         }
 
-        // Junk gate — BOTH modes: road noise, filler words ("huh", "uh huh"),
-        // and fragments with no real content and no COSMOS verb are dropped
-        // entirely — never sent, never spoken about, no reaction of any kind.
-        // (The [unk]-strip above already vanished pure-noise finals the same
-        // way.) In driving mode the mic stays hot for the next real utterance;
-        // in tap-to-talk it keeps waiting for the utterance the user tapped
-        // for — STOP is always one tap away.
+        // Junk gate — BOTH modes: road noise, filler words, and fragments
+        // with no real content and no COSMOS verb are dropped entirely.
         if (VoiceGrammar.isJunk(norm)) {
             log("(ignored as noise: \"$raw\")")
             return
         }
-        if (state.drivingMode.value) {
+        if (continuous) {
             // Everything else goes to COSMOS — the SERVER classifies it and
             // returns `kind`; the SPOKEN reply is moderated in handleReply
-            // from that classification, never from a client-side verb guess
-            // (the guess mis-fired on Vosk output and suppressed real command
-            // replies to "Noted."). The verb guess survives only as a
-            // best-effort hint that skips the pre-send "Got it, thinking."
-            // cue for probable ambient speech.
+            // from that classification.
             send(raw, null, quiet = !VoiceGrammar.startsWithKnownVerb(norm))
         } else {
             send(raw, null, quiet = false)
-            stopAfterUtterance() // tap-to-talk: one utterance per tap
+            stopAfterUtterance() // one utterance per tap/hold
         }
     }
 
     // ---------- COSMOS API ----------
 
+    /** Every /voice payload carries the same envelope: utterance + mode +
+     *  stream + session + build + client id + idempotency key. Old field
+     *  names (transcript / request_id) ride along for server compatibility. */
+    private fun voiceBody(transcript: String): JSONObject {
+        val rid = UUID.randomUUID().toString()
+        val body = JSONObject()
+            .put("transcript", transcript)
+            .put("utterance", transcript)
+            .put("mode", if (state.dictateMode.value) "dictate" else "command")
+            .put("project", state.stream.value)
+            .put("stream", state.stream.value)
+            .put("verbosity", state.verbosity.value)
+            .put("build", BuildConfig.VERSION_NAME)
+            .put("client_id", clientId)
+            .put("request_id", rid)
+            .put("idempotency_key", rid)
+        state.sessionId.value?.let { body.put("session_id", it) }
+        return body
+    }
+
     /**
-     * POST a transcript to COSMOS.
-     *
-     * `quiet` is a best-effort CLIENT hint ("this is probably ambient speech")
-     * and does exactly one thing: it suppresses the pre-send "Got it,
-     * thinking." cue in driving mode. It does NOT moderate the spoken reply —
-     * that decision is made in handleReply from the SERVER's `kind`
-     * classification, because the client guess (Vosk casing/tokenization) has
-     * wrongly quieted real commands before.
+     * POST a transcript to COSMOS. `quiet` suppresses the pre-send "Got it,
+     * thinking." cue in continuous mode only. `action` tags the payload with a
+     * server-side action (e.g. "bootup").
      */
-    private fun send(transcript: String, confirmId: String?, quiet: Boolean = false) {
+    private fun send(
+        transcript: String,
+        confirmId: String?,
+        quiet: Boolean = false,
+        action: String? = null
+    ) {
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
             log("Set the server URL first.")
-            if (state.drivingMode.value) speak("No server URL is set.")
+            if (continuous) speak("No server URL is set.")
             return
         }
-        if (state.drivingMode.value && !quiet && confirmId == null) {
+        if (controlPaused) {
+            log("(PAUSED by control — not sent: \"$transcript\")")
+            return
+        }
+        if (continuous && !quiet && confirmId == null) {
             cue("Got it, thinking.")
         }
         haptics.sent()             // double-tick: recognized and on its way
         state.thinking.value = true // THINKING phase until the server answers
-        // Build the FULL request up front, request_id included, so the exact
-        // same request (same idempotency key) is what gets queued on failure
-        // and replayed by the flush — the server can dedupe a retry.
-        val body = JSONObject()
-            .put("transcript", transcript)
-            .put("request_id", UUID.randomUUID().toString())
-        state.sessionId.value?.let { body.put("session_id", it) }
+        // Build the FULL request up front, idempotency key included, so the
+        // exact same request is what gets queued on failure and replayed by
+        // the flush — the server can dedupe a retry.
+        val body = voiceBody(transcript)
         if (confirmId != null) body.put("confirm_id", confirmId)
-        lifecycleScope.launch(Dispatchers.IO) {
+        if (action != null) body.put("action", action)
+        netScope.launch {
             try {
                 val resp = CosmosClient.postVoice(base, state.token.value.trim(), body)
                 withContext(Dispatchers.Main) {
@@ -1017,6 +1403,8 @@ class MainActivity : ComponentActivity() {
                     onServerReachable(true)
                     handleReply(transcript, resp)
                 }
+            } catch (e: CancellationException) {
+                throw e // STOP cancelled us — no state to fix, performStop did it
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     state.thinking.value = false
@@ -1029,39 +1417,35 @@ class MainActivity : ComponentActivity() {
     }
 
     /**
-     * ==================== OFFLINE-QUEUE STATE MACHINE ====================
-     * A failed POST never loses the command:
-     *  - Plain transcript -> enqueued (persisted to SharedPreferences) and
-     *    announced "Saved, no signal..." The queue is flushed IN ORDER on the
-     *    next successful /status ping (20s poll while driving) or network-up
-     *    event; each flushed reply is spoken as it lands (QUEUE_ADD so they
-     *    read out sequentially). An item is removed only AFTER its POST
-     *    succeeds, so a flush interrupted by signal loss keeps the remainder.
-     *  - Confirm re-POST -> NOT queued. The confirm_id nonce is single-use
-     *    and may be stale/expired by the time signal returns; silently firing
-     *    a destructive action minutes later is exactly what a driver would
-     *    not expect. The user re-issues the command instead.
-     * =====================================================================
+     * Send failure policy:
+     *  - DEFAULT (offline queue off): SEND-NOW-OR-DISCARD — the transcript is
+     *    dropped with a log; nothing replays later.
+     *  - Offline queue ON: plain transcripts queue (5 max / 120s TTL, oldest
+     *    dropped); the flush replays them in order when signal returns.
+     *  - Confirm re-POSTs are NEVER queued — the nonce is single-use and
+     *    firing a destructive action minutes later is what nobody expects.
      */
     private fun onSendFailed(transcript: String, confirmId: String?, body: JSONObject) {
         if (confirmId != null) {
             log("Confirm re-POST failed — nonce dropped (single-use, not queued).")
-            if (state.drivingMode.value) {
+            if (continuous) {
                 speak("Couldn't reach COSMOS. The confirmation was not sent. Ask again when we're back online.")
             }
-        } else {
-            // Queue the FULL request (request_id + session_id), not just the
-            // transcript — the flush replays it verbatim so the server can
-            // dedupe if the original POST actually landed.
-            val dropped = queue.add(body.toString())
-            state.queueSize.value = queue.size
-            if (dropped > 0) {
-                log("QUEUE FULL (${OfflineQueue.MAX_ITEMS}) — dropped $dropped oldest item(s).")
-            }
-            log("QUEUED offline (${queue.size} pending): \"$transcript\"")
-            if (state.drivingMode.value) {
-                speak("Saved, no signal. I'll send it when we're back.")
-            }
+            return
+        }
+        if (!state.offlineQueueOn.value) {
+            log("DISCARDED (send-now-or-discard): \"$transcript\"")
+            if (continuous) speak("Couldn't reach COSMOS. That was not saved.")
+            return
+        }
+        val dropped = queue.add(body.toString())
+        state.queueSize.value = queue.size
+        if (dropped > 0) {
+            log("QUEUE FULL (${OfflineQueue.MAX_ITEMS}) — dropped $dropped oldest item(s).")
+        }
+        log("QUEUED offline (${queue.size} pending): \"$transcript\"")
+        if (continuous) {
+            speak("Saved, no signal. I'll send it when we're back.")
         }
     }
 
@@ -1069,6 +1453,7 @@ class MainActivity : ComponentActivity() {
      *  the remainder) the moment a send fails again. */
     private fun tryFlush() {
         if (flushing || queue.size == 0) return
+        if (controlPaused) return // remote pause blocks the flush too
         flushing = true
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
@@ -1088,13 +1473,10 @@ class MainActivity : ComponentActivity() {
         }
         val n = queue.size
         cue("Back online. Sending $n saved ${if (n == 1) "command" else "commands"}.")
-        lifecycleScope.launch(Dispatchers.IO) {
+        netScope.launch {
             try {
                 while (true) {
                     val item = queue.peek() ?: break
-                    // Items are full request bodies (JSON with request_id).
-                    // Legacy items from older builds are bare transcripts —
-                    // wrap those on the fly (they get a fresh request_id).
                     val body = try {
                         JSONObject(item)
                     } catch (e: Exception) {
@@ -1109,11 +1491,12 @@ class MainActivity : ComponentActivity() {
                         state.queueSize.value = queue.size
                         log("FLUSHED: \"$shownTranscript\"")
                         // add=true: flushed replies queue up behind each other
-                        // instead of each one cutting off the last. Flushed
-                        // dictation stays silent (server `kind` rule applies).
+                        // instead of each one cutting off the last.
                         handleReply(shownTranscript, resp, add = true)
                     }
                 }
+            } catch (e: CancellationException) {
+                throw e // STOP cancelled the flush; performStop cleared the queue
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     log("FLUSH stopped, ${queue.size} still queued: ${e.message}")
@@ -1154,15 +1537,12 @@ class MainActivity : ComponentActivity() {
                         state.pendingConfirmId.value = null
                         state.pendingTranscript.value = null
                         log("CONFIRM EXPIRED (${CONFIRM_TTL_MS / 1000}s) — nonce dropped.")
-                        if (state.drivingMode.value) speak("That confirmation expired.")
+                        if (continuous) speak("That confirmation expired.")
                     }
                 }
                 // Two strong pulses: a consequential confirm is FELT, not just heard.
                 haptics.alert()
                 log("NEEDS CONFIRM — say yes/no (or tap CONFIRM). Never auto-run.")
-                // Voice confirm: the driver never has to tap. Spoken with kind
-                // "confirm" -> barge-in disabled + mid-prompt finals ignored
-                // (see the state machine in onFinalTranscript).
                 val summary = spoken.ifBlank { original }
                 speak(
                     "Confirm: $summary. Say yes to confirm, or no to cancel.",
@@ -1174,7 +1554,7 @@ class MainActivity : ComponentActivity() {
         }
 
         // Haptic for the reply itself: refusal gets the strong double-pulse,
-        // everything else a soft "reply arrived" buzz (fires alongside TTS start).
+        // everything else a soft "reply arrived" buzz.
         if (refused) haptics.alert() else haptics.reply()
 
         val shown = if (spoken.isNotBlank()) spoken else o.toString().take(400)
@@ -1188,22 +1568,17 @@ class MainActivity : ComponentActivity() {
 
         // ==================== SPOKEN MODERATION ====================
         // Decided by the SERVER's `kind`, never by a client-side verb guess.
-        // Rule: pure dictation is SILENT. kind == "dictation" (and not
-        // refused) produces NO TTS at all — no "Noted.", no cue — in every
-        // mode (driving, desk, and flushed queue items alike). It is already
-        // logged to the console above, which is the only trace it leaves.
-        // Everything else — command / ask / query / unknown / refused, and
-        // the needs_confirm prompt handled above — speaks IN FULL, as before.
+        // Rule: pure dictation is SILENT.
         if (kind == "dictation" && !refused) {
             log("(dictation — noted silently, not spoken)")
             return
         }
         val toSpeak: String? = when {
             spoken.isNotBlank() -> spoken
-            state.drivingMode.value && refused -> "COSMOS refused that."
-            state.drivingMode.value && o.has("http_status") ->
+            continuous && refused -> "COSMOS refused that."
+            continuous && o.has("http_status") ->
                 "Server error ${o.optInt("http_status")}."
-            state.drivingMode.value -> "Done."
+            continuous -> "Done."
             else -> null
         }
         if (toSpeak != null) {
@@ -1222,6 +1597,21 @@ class MainActivity : ComponentActivity() {
         send(original, cid)
     }
 
+    // ---------- stream / session / bootup ----------
+
+    /** Invoke server BootUP for the selected stream (a tagged /voice action). */
+    private fun bootUp() {
+        val s = state.stream.value
+        log("BootUP! → $s")
+        send("BootUP! $s", null, quiet = true, action = "bootup")
+    }
+
+    private fun newSession() {
+        state.sessionId.value = null
+        log("NEW SESSION — the next reply starts a fresh session id.")
+        cue("New session.")
+    }
+
     // ---------- console ----------
 
     private fun log(line: String) {
@@ -1235,34 +1625,81 @@ class MainActivity : ComponentActivity() {
     private companion object {
         /** How long a pending confirm nonce stays live on the client. */
         const val CONFIRM_TTL_MS = 30_000L
+
+        /** T2T endpoint: ~1s of silence after speech closes the capture. */
+        const val T2T_SILENCE_MS = 1_000L
+
+        /** T2T: give up if nothing is heard at all for this long. */
+        const val T2T_MAX_WAIT_MS = 8_000L
     }
 }
 
 // ============================== UI ==============================
 
+private val STREAMS = listOf("plumbing", "physics", "chapter", "legal")
+
 @Composable
 fun AppScreen(
     state: AppState,
+    buildName: String,
     onConnect: () -> Unit,
-    onMic: () -> Unit,
+    onMicTap: () -> Unit,
+    onPttStart: () -> Unit,
+    onPttRelease: () -> Unit,
+    onStop: () -> Unit,
     onConfirm: () -> Unit,
     onSave: () -> Unit,
-    onDriving: () -> Unit,
+    onContinuousRequest: () -> Unit,
+    onContinuousConfirm: () -> Unit,
+    onContinuousDismiss: () -> Unit,
     onHaptics: (Boolean) -> Unit,
     onDictate: () -> Unit,
-    onPhoneMic: (Boolean) -> Unit
+    onPhoneMic: (Boolean) -> Unit,
+    onOfflineQueue: (Boolean) -> Unit,
+    onStream: (String) -> Unit,
+    onBootUp: () -> Unit,
+    onNewSession: () -> Unit,
+    onVerbosity: (String) -> Unit,
+    onSpeechRate: (Float) -> Unit,
+    onSayAgain: () -> Unit
 ) {
+    val mic = state.micState.value
     // One visual phase drives the mic button, pulse ring, spinner, and the
     // big glanceable label. Priority: SPEAKING > THINKING > LISTENING > IDLE.
     val phase = when {
         state.speaking.value -> VoicePhase.SPEAKING
         state.thinking.value -> VoicePhase.THINKING
-        state.listening.value -> VoicePhase.LISTENING
+        mic != MicState.OFF -> VoicePhase.LISTENING
         else -> VoicePhase.IDLE
     }
     val listenColor = Color(0xFFB3261E)  // red — listening
     val thinkColor = Color(0xFFF9A825)   // amber — waiting on the server
     val speakColor = Color(0xFF1565C0)   // blue — TTS talking
+    val stopRed = Color(0xFFC62828)
+
+    // Two-step CONTINUOUS opt-in: the dialog IS step two.
+    if (state.showContinuousConfirm.value) {
+        AlertDialog(
+            onDismissRequest = onContinuousDismiss,
+            title = { Text("Keep the mic on continuously?") },
+            text = {
+                Text(
+                    "The microphone stays LIVE and everything heard goes to " +
+                        "COSMOS until you tap STOP. A red LIVE banner shows " +
+                        "the whole time."
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = onContinuousConfirm,
+                    colors = ButtonDefaults.buttonColors(containerColor = stopRed)
+                ) { Text("GO LIVE") }
+            },
+            dismissButton = {
+                TextButton(onClick = onContinuousDismiss) { Text("Cancel") }
+            }
+        )
+    }
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
@@ -1271,13 +1708,52 @@ fun AppScreen(
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(
                     text = "COSMOS Voice",
-                    style = MaterialTheme.typography.titleLarge,
+                    style = MaterialTheme.typography.titleLarge
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = "v$buildName",
+                    style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.weight(1f)
                 )
                 TextButton(onClick = { state.showSettings.value = !state.showSettings.value }) {
                     Text(if (state.showSettings.value) "hide setup" else "setup")
                 }
             }
+
+            // Persistent LIVE banner — continuous mode is never invisible.
+            if (mic == MicState.CONTINUOUS) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(stopRed)
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "● LIVE — tap STOP to end",
+                        color = Color.White,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp
+                    )
+                }
+            }
+            if (state.pausedByControl.value) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(thinkColor)
+                        .padding(vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "PAUSED by control — nothing is sent",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
             Text(
                 text = "server: ${state.connStatus.value} · net: ${state.netStatus.value}" +
                     (if (state.queueSize.value > 0) " · queued: ${state.queueSize.value}" else ""),
@@ -1285,25 +1761,9 @@ fun AppScreen(
             )
             Text(
                 text = "voice model: ${state.modelStatus.value}" +
-                    "  ·  voice out: ${state.ttsStatus.value}" +
-                    (state.sessionId.value?.let { "  ·  session ${it.take(8)}" } ?: ""),
+                    "  ·  voice out: ${state.ttsStatus.value}",
                 style = MaterialTheme.typography.bodySmall
             )
-
-            // Big top-level DRIVING MODE toggle (also voice: "driving mode on/off")
-            Button(
-                onClick = onDriving,
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp).height(64.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (state.drivingMode.value) Color(0xFF2E7D32)
-                    else Color(0xFF49454F)
-                )
-            ) {
-                Text(
-                    text = if (state.drivingMode.value) "DRIVING MODE ON" else "DRIVING MODE OFF",
-                    fontSize = 18.sp
-                )
-            }
 
             // Settings
             if (state.showSettings.value) {
@@ -1316,8 +1776,8 @@ fun AppScreen(
                 )
                 OutlinedTextField(
                     value = state.token.value,
-                    onValueChange = { state.token.value = it; onSave() },
-                    label = { Text("Bearer token (blank = no auth)") },
+                    onValueChange = { state.token.value = it },
+                    label = { Text("Bearer token (memory only — blank = no auth)") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
                 )
@@ -1347,6 +1807,19 @@ fun AppScreen(
                         onCheckedChange = onPhoneMic
                     )
                 }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Text(
+                        text = "Offline queue (else send-now-or-discard)",
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = state.offlineQueueOn.value,
+                        onCheckedChange = onOfflineQueue
+                    )
+                }
                 Button(
                     onClick = onConnect,
                     modifier = Modifier.padding(top = 8.dp)
@@ -1369,17 +1842,69 @@ fun AppScreen(
                 )
             }
 
-            // Recognition-mode indicator + toggle: COMMAND (grammar) / DICTATE
-            // (open speech, one utterance). Also voice: "ask" / "done".
+            // Stream picker — big targets, the selection tags every payload.
+            Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
+                STREAMS.forEach { s ->
+                    val selected = state.stream.value == s
+                    Button(
+                        onClick = { onStream(s) },
+                        modifier = Modifier.weight(1f).padding(horizontal = 2.dp).height(52.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (selected) Color(0xFF2E7D32) else Color(0xFF49454F)
+                        )
+                    ) {
+                        Text(s, fontSize = 13.sp, maxLines = 1)
+                    }
+                }
+            }
+
+            // BootUP + session controls + continuous entry.
             Row(
                 verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+            ) {
+                Button(
+                    onClick = onBootUp,
+                    modifier = Modifier.weight(1f).padding(end = 4.dp).height(52.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
+                ) {
+                    Text("BootUP!", fontSize = 16.sp)
+                }
+                Button(
+                    onClick = onContinuousRequest,
+                    modifier = Modifier.weight(1f).padding(start = 4.dp).height(52.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (mic == MicState.CONTINUOUS) stopRed else Color(0xFF49454F)
+                    )
+                ) {
+                    Text(
+                        if (mic == MicState.CONTINUOUS) "LIVE" else "CONTINUOUS…",
+                        fontSize = 14.sp
+                    )
+                }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "session: ${state.sessionId.value?.take(8) ?: "(new)"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier.weight(1f)
+                )
+                TextButton(onClick = onNewSession) { Text("new session") }
+            }
+
+            // Recognition-mode chip + toggle: COMMAND (grammar) / DICTATE.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
             ) {
                 Text(
                     text = if (state.dictateMode.value) "● DICTATE" else "● COMMAND",
                     color = if (state.dictateMode.value) Color(0xFF1565C0) else Color(0xFF2E7D32),
                     fontWeight = FontWeight.Bold,
-                    style = MaterialTheme.typography.bodySmall,
+                    fontSize = 16.sp,
                     modifier = Modifier.weight(1f)
                 )
                 TextButton(onClick = onDictate) {
@@ -1391,14 +1916,10 @@ fun AppScreen(
             Text(
                 text = if (state.partial.value.isBlank()) " " else state.partial.value,
                 style = MaterialTheme.typography.bodyLarge,
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)
             )
 
-            // Big mic button (tap to toggle) — the button IS the status light:
-            //   IDLE      neutral (theme primary)
-            //   LISTENING red + breathing pulse ring
-            //   THINKING  amber + spinner around the button
-            //   SPEAKING  blue + faster pulse ring
+            // Big mic button — TAP = one utterance (T2T), HOLD = push-to-talk.
             val micColor = animateColorAsState(
                 targetValue = when (phase) {
                     VoicePhase.LISTENING -> listenColor
@@ -1409,11 +1930,9 @@ fun AppScreen(
                 label = "micColor"
             )
             Box(
-                modifier = Modifier.fillMaxWidth().height(150.dp),
+                modifier = Modifier.fillMaxWidth().height(140.dp),
                 contentAlignment = Alignment.Center
             ) {
-                // Breathing pulse ring while listening (slow) or speaking (faster).
-                // Composed only in those phases, so it costs nothing when idle.
                 if (phase == VoicePhase.LISTENING || phase == VoicePhase.SPEAKING) {
                     val period = if (phase == VoicePhase.LISTENING) 900 else 550
                     val pulse = rememberInfiniteTransition(label = "pulse")
@@ -1437,7 +1956,7 @@ fun AppScreen(
                     )
                     Box(
                         modifier = Modifier
-                            .size(124.dp)
+                            .size(118.dp)
                             .scale(ringScale.value)
                             .background(
                                 micColor.value.copy(alpha = ringAlpha.value),
@@ -1445,46 +1964,69 @@ fun AppScreen(
                             )
                     )
                 }
-                Button(
-                    onClick = onMic,
-                    shape = CircleShape,
-                    modifier = Modifier.size(120.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = micColor.value)
+                Box(
+                    modifier = Modifier
+                        .size(114.dp)
+                        .background(micColor.value, CircleShape)
+                        .pointerInput(Unit) {
+                            detectTapGestures(
+                                onTap = { onMicTap() },
+                                onLongPress = { onPttStart() },
+                                onPress = {
+                                    tryAwaitRelease()
+                                    onPttRelease() // no-op unless PTT is live
+                                }
+                            )
+                        },
+                    contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        // MIC = idle, tap to capture ONE utterance.
-                        // LISTENING = tap-to-talk capture in progress (auto-
-                        //             stops on end of speech; tap cancels).
-                        // STOP = driving mode's continuous listening — tap for
-                        //        a hard stop (also exits driving mode).
-                        text = when {
-                            !state.listening.value -> "MIC"
-                            state.drivingMode.value -> "STOP"
-                            else -> "LISTENING"
+                        text = when (mic) {
+                            MicState.OFF -> "TALK"
+                            MicState.LISTENING_T2T -> "LISTENING"
+                            MicState.LISTENING_PTT -> "HOLDING"
+                            MicState.CONTINUOUS -> "LIVE"
                         },
-                        fontSize = 20.sp,
+                        color = Color.White,
+                        fontSize = 18.sp,
+                        fontWeight = FontWeight.Bold,
                         textAlign = TextAlign.Center
                     )
                 }
-                // Spinner ringing the button while a POST is in flight.
                 if (phase == VoicePhase.THINKING) {
                     CircularProgressIndicator(
-                        modifier = Modifier.size(136.dp),
+                        modifier = Modifier.size(130.dp),
                         color = thinkColor,
                         strokeWidth = 4.dp
                     )
                 }
             }
+            Text(
+                text = "tap = one utterance · hold = push-to-talk",
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            // THE BIG RED STOP — authoritative, always present, from any state.
+            Button(
+                onClick = onStop,
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(64.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = stopRed)
+            ) {
+                Text("STOP", fontSize = 24.sp, fontWeight = FontWeight.Bold)
+            }
 
             // Big glanceable state label — readable while driving.
             Text(
                 text = when (phase) {
-                    VoicePhase.LISTENING -> "Listening…"
+                    VoicePhase.LISTENING ->
+                        if (mic == MicState.CONTINUOUS) "LIVE — listening…" else "Listening…"
                     VoicePhase.THINKING -> "Thinking…"
                     VoicePhase.SPEAKING -> "Speaking…"
                     VoicePhase.IDLE -> "Tap to talk"
                 },
-                fontSize = 28.sp,
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center,
                 color = when (phase) {
@@ -1493,22 +2035,57 @@ fun AppScreen(
                     VoicePhase.SPEAKING -> speakColor
                     VoicePhase.IDLE -> MaterialTheme.colorScheme.onSurface
                 },
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
             )
+
+            // Verbosity + speech rate + say-again.
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth().padding(top = 2.dp)
+            ) {
+                listOf("brief", "normal", "full").forEach { v ->
+                    val sel = state.verbosity.value == v
+                    TextButton(onClick = { onVerbosity(v) }) {
+                        Text(
+                            v,
+                            fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                            color = if (sel) Color(0xFF2E7D32) else MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.weight(1f))
+                TextButton(onClick = onSayAgain) { Text("SAY AGAIN") }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("rate", style = MaterialTheme.typography.bodySmall)
+                Slider(
+                    value = state.speechRate.value,
+                    onValueChange = onSpeechRate,
+                    valueRange = 0.5f..2.0f,
+                    modifier = Modifier.weight(1f).padding(horizontal = 8.dp)
+                )
+                Text(
+                    String.format(Locale.US, "%.1fx", state.speechRate.value),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
 
             // Confirm (single-use nonce, never auto-run). Voice ("yes"/"no")
             // always works when pending; the button is the fallback.
             if (state.pendingConfirmId.value != null) {
                 Button(
                     onClick = onConfirm,
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7D5260))
                 ) {
                     Text("CONFIRM — run it (or say YES / NO)")
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             Divider()
 
             // Console (newest first)
