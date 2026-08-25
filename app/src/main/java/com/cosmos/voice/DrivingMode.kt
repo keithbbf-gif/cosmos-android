@@ -2,6 +2,7 @@ package com.cosmos.voice
 
 import android.content.SharedPreferences
 import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
 
 /**
@@ -171,6 +172,8 @@ object VoiceGrammar {
  */
 class OfflineQueue(private val prefs: SharedPreferences) {
 
+    // Each element is a wrapper JSON string: {"body": <request JSON>, "ts": <epoch ms>}.
+    // The timestamp exists so stale voice never replays (see pruneStale).
     private val items = mutableListOf<String>()
 
     /** Non-null when the persisted queue failed to parse at startup. The raw
@@ -178,14 +181,20 @@ class OfflineQueue(private val prefs: SharedPreferences) {
     var loadError: String? = null
         private set
 
+    /** Items discarded at construction. Voice is EPHEMERAL: a backlog from a
+     *  previous process is stale by definition (queued commands cannot be told
+     *  apart from dictation client-side — the SERVER classifies), so a fresh
+     *  app start drops the whole persisted backlog and reports the count.
+     *  Without this, reconnecting replayed old context ("scrolls back"). */
+    var droppedAtLoad: Int = 0
+        private set
+
     init {
         val raw = prefs.getString(KEY, "[]") ?: "[]"
         try {
             val arr = JSONArray(raw)
-            for (i in 0 until arr.length()) {
-                val s = arr.optString(i)
-                if (s.isNotBlank()) items.add(s)
-            }
+            droppedAtLoad = arr.length()
+            if (droppedAtLoad > 0) persist() // start empty; count reported by caller
         } catch (e: Exception) {
             // NEVER silently discard: preserve the corrupt payload for
             // post-mortem and surface the error to the caller's log.
@@ -197,11 +206,16 @@ class OfflineQueue(private val prefs: SharedPreferences) {
 
     val size: Int get() = synchronized(items) { items.size }
 
-    /** Add a full request-body JSON string. Returns the number of oldest
-     *  items dropped to stay under the cap (0 normally). */
+    /** Add a full request-body JSON string (timestamped now). Returns the
+     *  number of oldest items dropped to stay under the cap (0 normally). */
     fun add(requestJson: String): Int {
         synchronized(items) {
-            items.add(requestJson)
+            items.add(
+                JSONObject()
+                    .put("body", requestJson)
+                    .put("ts", System.currentTimeMillis())
+                    .toString()
+            )
             var dropped = 0
             while (items.size > MAX_ITEMS) {
                 items.removeAt(0)
@@ -212,8 +226,40 @@ class OfflineQueue(private val prefs: SharedPreferences) {
         }
     }
 
-    /** Oldest item, without removing it (remove only after a successful send). */
-    fun peek(): String? = synchronized(items) { items.firstOrNull() }
+    /** Drop every queued item older than MAX_AGE_MS — a stale voice command
+     *  must NOT replay when signal returns. Items with no timestamp (legacy
+     *  builds) are treated as stale. Call before flushing. Returns the count
+     *  dropped so the caller can log it. */
+    fun pruneStale(now: Long = System.currentTimeMillis()): Int {
+        synchronized(items) {
+            val before = items.size
+            items.retainAll { item ->
+                val ts = try {
+                    JSONObject(item).optLong("ts", -1L)
+                } catch (e: Exception) {
+                    -1L
+                }
+                ts >= 0 && now - ts <= MAX_AGE_MS
+            }
+            val dropped = before - items.size
+            if (dropped > 0) persist()
+            return dropped
+        }
+    }
+
+    /** Oldest item's request BODY, without removing it (remove only after a
+     *  successful send). Unwraps the {body, ts} envelope; a legacy bare item
+     *  is returned as-is. */
+    fun peek(): String? = synchronized(items) {
+        items.firstOrNull()?.let { item ->
+            try {
+                val o = JSONObject(item)
+                if (o.has("body")) o.optString("body", item) else item
+            } catch (e: Exception) {
+                item
+            }
+        }
+    }
 
     fun removeFirst() {
         synchronized(items) {
@@ -230,6 +276,8 @@ class OfflineQueue(private val prefs: SharedPreferences) {
 
     companion object {
         const val MAX_ITEMS = 100
+        /** Voice goes stale fast: anything older than this never replays. */
+        const val MAX_AGE_MS = 120_000L
         private const val KEY = "offline_queue"
         private const val KEY_CORRUPT_BACKUP = "offline_queue_corrupt_backup"
     }

@@ -166,6 +166,10 @@ class MainActivity : ComponentActivity() {
         queue = OfflineQueue(prefs)
         state.queueSize.value = queue.size
         queue.loadError?.let { log("OFFLINE QUEUE: $it") }
+        if (queue.droppedAtLoad > 0) {
+            log("OFFLINE QUEUE: dropped ${queue.droppedAtLoad} stale item(s) from a " +
+                "previous run — voice is ephemeral, old transcripts never replay.")
+        }
 
         state.hapticsOn.value = prefs.getBoolean("haptics_on", true)
         haptics = Haptics(this)
@@ -1010,6 +1014,17 @@ class MainActivity : ComponentActivity() {
         flushing = true
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
+            flushing = false
+            return
+        }
+        // Stale voice must not replay: age-gate the backlog before sending.
+        val stale = queue.pruneStale()
+        if (stale > 0) {
+            state.queueSize.value = queue.size
+            log("QUEUE: dropped $stale stale item(s) older than " +
+                "${OfflineQueue.MAX_AGE_MS / 1000}s — not replayed.")
+        }
+        if (queue.size == 0) {
             flushing = false
             return
         }
