@@ -11,8 +11,8 @@ android {
         applicationId = "com.cosmos.voice"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1"
+        versionCode = 2
+        versionName = "0.2"
     }
 
     buildTypes {
@@ -36,6 +36,9 @@ android {
 
     buildFeatures {
         compose = true
+        // BuildConfig.versionName is shown in the UI and sent as `build` in
+        // every /voice payload (AGP 8 defaults BuildConfig generation to off).
+        buildConfig = true
     }
     composeOptions {
         // Compose compiler 1.5.14 pairs with Kotlin 1.9.24.
