@@ -14,6 +14,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Normal permission (no runtime prompt): connectivity change cues in driving mode. -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- Normal permission (no runtime prompt): lets the "Use phone mic" option
+         keep Bluetooth SCO down so recognition uses the built-in mic while
+         TTS output stays on the BT headset (A2DP). -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Normal permission (no runtime prompt): eyes-free haptic cues (mic tick,
          sent double-tick, reply buzz, confirm/refusal pulses). -->
     <uses-permission android:name="android.permission.VIBRATE" />

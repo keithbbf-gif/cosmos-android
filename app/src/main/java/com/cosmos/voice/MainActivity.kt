@@ -3,6 +3,7 @@ package com.cosmos.voice
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.media.AudioManager
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Bundle
@@ -170,6 +171,11 @@ class MainActivity : ComponentActivity() {
         haptics = Haptics(this)
         haptics.enabled = state.hapticsOn.value
 
+        // Default ON: BT SCO narrowband headset mics (TOZO etc.) wreck VOSK
+        // recognition — keep INPUT on the phone mic; TTS OUTPUT stays on the
+        // headset over A2DP.
+        state.phoneMicOn.value = prefs.getBoolean("phone_mic", true)
+
         // Optional fallback engine only — absent on a stripped phone, and that
         // is fine: the bundled sherpa-onnx voice (prepareTtsVoice) is the default.
         tts = TextToSpeech(this) { status ->
@@ -218,7 +224,8 @@ class MainActivity : ComponentActivity() {
                     onSave = { saveSettings() },
                     onDriving = { setDrivingMode(!state.drivingMode.value) },
                     onHaptics = { on -> setHaptics(on) },
-                    onDictate = { setDictateMode(!state.dictateMode.value) }
+                    onDictate = { setDictateMode(!state.dictateMode.value) },
+                    onPhoneMic = { on -> setPhoneMic(on) }
                 )
             }
         }
@@ -471,6 +478,43 @@ class MainActivity : ComponentActivity() {
             .apply()
     }
 
+    /**
+     * Route audio INPUT to the built-in phone mic when the "Use phone mic"
+     * toggle is ON (default): make sure Bluetooth SCO is DOWN before the
+     * recognizer opens its AudioRecord. An AudioRecord on the MIC source only
+     * routes to a BT headset mic when SCO is active, so with SCO off the
+     * input is the device mic while BT keeps playing TTS output over A2DP.
+     * Toggle OFF = leave the system default routing alone (BT mic allowed).
+     * Called right before every recognizer start; best-effort.
+     */
+    private fun applyMicRoute() {
+        if (!state.phoneMicOn.value) return
+        try {
+            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+            @Suppress("DEPRECATION")
+            if (am.isBluetoothScoOn) {
+                am.stopBluetoothSco()
+                am.isBluetoothScoOn = false
+                log("(BT SCO mic disabled — using phone mic)")
+            }
+            if (am.mode != AudioManager.MODE_NORMAL) am.mode = AudioManager.MODE_NORMAL
+        } catch (e: Exception) {
+            log("MIC ROUTE: ${e.message?.take(80)}")
+        }
+    }
+
+    /** "Use phone mic" toggle — persisted, default ON. A live recognizer is
+     *  rebuilt so its AudioRecord re-opens on the new route. */
+    private fun setPhoneMic(on: Boolean) {
+        state.phoneMicOn.value = on
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putBoolean("phone_mic", on)
+            .apply()
+        log(if (on) "PHONE MIC — Bluetooth mic ignored (BT audio out still works)."
+            else "SYSTEM MIC ROUTING — Bluetooth mic allowed.")
+        if (state.listening.value) restartRecognizer()
+    }
+
     /** Haptics on/off toggle — persisted, default ON. */
     private fun setHaptics(on: Boolean) {
         state.hapticsOn.value = on
@@ -653,6 +697,7 @@ class MainActivity : ComponentActivity() {
         val v = voice ?: return
         v.stop()
         try {
+            applyMicRoute()
             v.start(currentGrammar())
             state.listening.value = true
         } catch (e: Exception) {
@@ -697,6 +742,7 @@ class MainActivity : ComponentActivity() {
         }
         ensureEngineLoaded {
             try {
+                applyMicRoute()
                 voice?.start(currentGrammar())
                 state.listening.value = true
                 updateMicService()
@@ -731,6 +777,7 @@ class MainActivity : ComponentActivity() {
             } else {
                 ensureEngineLoaded {
                     try {
+                        applyMicRoute()
                         voice?.start(currentGrammar())
                         state.listening.value = true
                         updateMicService()
@@ -747,6 +794,7 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
+            applyMicRoute()
             v.start(currentGrammar())
             state.listening.value = true
             log("(mic auto-restarted)")
@@ -1128,7 +1176,8 @@ fun AppScreen(
     onSave: () -> Unit,
     onDriving: () -> Unit,
     onHaptics: (Boolean) -> Unit,
-    onDictate: () -> Unit
+    onDictate: () -> Unit,
+    onPhoneMic: (Boolean) -> Unit
 ) {
     // One visual phase drives the mic button, pulse ring, spinner, and the
     // big glanceable label. Priority: SPEAKING > THINKING > LISTENING > IDLE.
@@ -1210,6 +1259,19 @@ fun AppScreen(
                     Switch(
                         checked = state.hapticsOn.value,
                         onCheckedChange = onHaptics
+                    )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Text(
+                        text = "Use phone mic (ignore Bluetooth mic)",
+                        modifier = Modifier.weight(1f)
+                    )
+                    Switch(
+                        checked = state.phoneMicOn.value,
+                        onCheckedChange = onPhoneMic
                     )
                 }
                 Button(
