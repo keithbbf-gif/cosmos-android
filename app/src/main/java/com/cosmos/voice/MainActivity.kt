@@ -398,6 +398,9 @@ class MainActivity : ComponentActivity() {
         endpointJob?.cancel()
         pollJob?.cancel()
         pollJob = null
+        // DELIBERATE: controlJob (the remote-control poll) is NOT cancelled —
+        // the phone must keep hearing remote resume/kill after a local STOP.
+        // Only onDestroy tears it down.
         confirmExpireJob?.cancel()
         state.pendingConfirmId.value = null
         state.pendingTranscript.value = null
@@ -955,9 +958,12 @@ class MainActivity : ComponentActivity() {
                     log("MODEL LOAD FAILED: ${e.message}")
                     if (continuous && !userStopped) {
                         // CONTINUOUS opt-in is still live: retry in a few
-                        // seconds (STOP makes this a no-op).
+                        // seconds (STOP makes this a no-op). Both conditions
+                        // are re-read after the delay — a STOP during the
+                        // wait must end the retry, not just defer it.
                         lifecycleScope.launch {
                             delay(5_000)
+                            if (userStopped || state.micState.value != MicState.CONTINUOUS) return@launch
                             restartMicIfNeeded()
                         }
                     }
@@ -994,8 +1000,17 @@ class MainActivity : ComponentActivity() {
      *  keeping the current mic state. */
     private fun restartRecognizer() {
         val v = voice ?: return
-        if (state.micState.value == MicState.OFF) return
+        if (userStopped || state.micState.value == MicState.OFF) return
         v.stop()
+        // Re-check IMMEDIATELY before starting: a performStop() landing
+        // between the gate above and this start must win — otherwise Vosk is
+        // recording while the UI says OFF. Defensive v.stop() in case a
+        // concurrent path started it in the gap (VoiceEngine.stop is
+        // idempotent and cheap).
+        if (userStopped || state.micState.value == MicState.OFF) {
+            v.stop()
+            return
+        }
         try {
             applyMicRoute()
             v.start(currentGrammar())
@@ -1106,6 +1121,9 @@ class MainActivity : ComponentActivity() {
             }
             try {
                 applyMicRoute()
+                // Last-gate re-check: the engine load was async, and nothing
+                // between here and start() may override a STOP that raced in.
+                if (userStopped) return@ensureEngineLoaded
                 voice?.start(currentGrammar())
                 state.micState.value = target
                 updateMicService()
@@ -1190,6 +1208,8 @@ class MainActivity : ComponentActivity() {
                 if (userStopped || state.micState.value != MicState.CONTINUOUS) return@ensureEngineLoaded
                 try {
                     applyMicRoute()
+                    // Last-gate re-check before opening the mic (STOP races).
+                    if (userStopped || state.micState.value != MicState.CONTINUOUS) return@ensureEngineLoaded
                     voice?.start(currentGrammar())
                     updateMicService()
                     log("(mic auto-restarted after model load)")
@@ -1202,6 +1222,8 @@ class MainActivity : ComponentActivity() {
         if (v.isRunning) return
         try {
             applyMicRoute()
+            // Last-gate re-check before opening the mic (STOP races).
+            if (userStopped || state.micState.value != MicState.CONTINUOUS) return
             v.start(currentGrammar())
             log("(mic auto-restarted)")
         } catch (e: Exception) {
@@ -1210,10 +1232,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scheduleMicRetry(msg: String) {
-        if (userStopped) return // the user said STOP — no retry loop
+        // Retry ONLY while the CONTINUOUS opt-in is still live AND the user
+        // has not stopped — guard BOTH: a stop can flip either flag first,
+        // and a retry loop must never outlive the state it keeps alive.
+        if (userStopped || state.micState.value != MicState.CONTINUOUS) return
         log("$msg — retrying in 2s")
         lifecycleScope.launch {
             delay(2_000)
+            // Re-check after the async gap; restartMicIfNeeded re-checks
+            // both again, but a STOP during the delay must end the loop here.
+            if (userStopped || state.micState.value != MicState.CONTINUOUS) return@launch
             restartMicIfNeeded()
         }
     }
@@ -1233,6 +1261,21 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun onFinalTranscript(text: String) {
+        // ============= AUTHORITATIVE-STOP GATE (late-final race) =============
+        // Vosk finals are delivered ASYNCHRONOUSLY (posted to the main
+        // handler), so one can land AFTER performStop() — including the final
+        // that performStop's own voice.stop() flushes out. After a hard stop
+        // it must be DROPPED: never classified, never confirmed, never sent,
+        // never queued. userStopped is the flag every stop path sets and only
+        // an explicit user start clears.
+        // NOTE deliberately NOT gated on micState == OFF: the normal T2T/PTT
+        // endpoint ("stop the recognizer to flush the final, then send it")
+        // delivers its final after micState has already gone OFF — that is
+        // the one legitimate late final, and userStopped tells them apart.
+        if (userStopped) {
+            log("(dropped after STOP: \"${text.trim().take(60)}\")")
+            return
+        }
         state.partial.value = ""
         // COMMAND mode's grammar surfaces out-of-vocabulary audio as "[unk]"
         // tokens instead of hallucinated sentences. Strip them; a final that
@@ -1244,11 +1287,24 @@ class MainActivity : ComponentActivity() {
         if (raw.isBlank()) return
         val norm = VoiceGrammar.normalize(raw)
 
+        // Spoken authoritative STOP — checked BEFORE everything, including
+        // the pending-confirm branch, so saying "stop" always stops: mic off,
+        // speech killed, requests aborted, AND the pending nonce dropped
+        // (performStop clears it). A confirm dialog must never be able to
+        // swallow the stop word as a mere "cancel" answer. (The confirm
+        // prompt text never contains the word "stop", so the echo guard is
+        // not needed for this path.)
+        if (VoiceGrammar.isStop(norm)) {
+            log("YOU: $raw")
+            performStop("voice")
+            return
+        }
+
         // ================= PENDING-CONFIRM STATE MACHINE =================
         // AWAITING_YESNO: the next final is the ANSWER to "Confirm: ...?" and
-        // is NEVER treated as a new command. Echo guard: a final completing
-        // while the confirm prompt is still speaking is the phone hearing its
-        // own prompt — discarded.
+        // is NEVER treated as a new command ("stop" excepted — handled above).
+        // Echo guard: a final completing while the confirm prompt is still
+        // speaking is the phone hearing its own prompt — discarded.
         // =================================================================
         if (state.pendingConfirmId.value != null) {
             if (ttsSpeaking && currentUtteranceKind == "confirm") {
@@ -1266,14 +1322,6 @@ class MainActivity : ComponentActivity() {
                 speak("Cancelled.")
             }
             stopAfterUtterance() // confirm answered — one-shot capture goes idle
-            return
-        }
-
-        // Spoken authoritative STOP — works in every mode, before anything
-        // else can consume the word.
-        if (VoiceGrammar.isStop(norm)) {
-            log("YOU: $raw")
-            performStop("voice")
             return
         }
 
@@ -1374,6 +1422,18 @@ class MainActivity : ComponentActivity() {
         quiet: Boolean = false,
         action: String? = null
     ) {
+        // ============= AUTHORITATIVE-STOP GATE (late-send race) =============
+        // Belt to onFinalTranscript's braces: a voice-originated transcript
+        // (confirmId == null && action == null — every such call comes from
+        // onFinalTranscript) must never POST or queue after a hard stop,
+        // however late the recognizer delivered it. Explicit BUTTON actions
+        // (BootUP!, the CONFIRM button) are user gestures, not audio — they
+        // stay allowed; a stale confirm nonce is already impossible because
+        // performStop clears pendingConfirmId.
+        if (userStopped && confirmId == null && action == null) {
+            log("(not sent — STOP is in effect: \"${transcript.take(60)}\")")
+            return
+        }
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
             log("Set the server URL first.")

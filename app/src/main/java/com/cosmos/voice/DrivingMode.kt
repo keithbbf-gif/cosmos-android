@@ -60,9 +60,10 @@ object VoiceGrammar {
 
     fun isSayAgain(norm: String): Boolean = stripWake(normalize(norm)) in SAY_AGAIN
 
-    /** A spoken authoritative STOP: "stop" / "stop listening". Only consulted
-     *  when NO confirm is pending (a pending confirm consumes "stop" as a
-     *  cancel answer first — that path runs earlier). */
+    /** A spoken authoritative STOP: "stop" / "stop listening". Checked FIRST
+     *  in onFinalTranscript — BEFORE the pending-confirm branch — so "stop"
+     *  always performs the full authoritative stop (mic off, nonce dropped),
+     *  even while a confirm dialog is pending. */
     fun isStop(norm: String): Boolean =
         stripWake(normalize(norm)) in setOf("stop", "stop listening")
 
