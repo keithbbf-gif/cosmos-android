@@ -11,8 +11,22 @@ android {
         applicationId = "com.cosmos.voice"
         minSdk = 26
         targetSdk = 34
-        versionCode = 5
-        versionName = "0.5"
+        versionCode = 6
+        versionName = "0.6"
+    }
+
+    signingConfigs {
+        // ONE stable, committed dev key. Every CI runner used to mint its own
+        // ephemeral debug keystore, so each new APK's signature conflicted with
+        // the installed one and forced a full uninstall. This keystore is
+        // deliberately in-repo (dev key only — never a Play release key).
+        // Path is module-relative, so it resolves identically locally and in CI.
+        getByName("debug") {
+            storeFile = file("cosmos-debug.keystore")
+            storePassword = "cosmos123"
+            keyAlias = "cosmos"
+            keyPassword = "cosmos123"
+        }
     }
 
     buildTypes {
@@ -23,7 +37,10 @@ android {
                 "proguard-rules.pro"
             )
         }
-        // debug: defaults are fine (debuggable, unsigned-with-debug-key).
+        debug {
+            // assembleDebug signs with the committed key, not the per-runner default.
+            signingConfig = signingConfigs.getByName("debug")
+        }
     }
 
     compileOptions {
