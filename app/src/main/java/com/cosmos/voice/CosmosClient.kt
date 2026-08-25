@@ -24,6 +24,27 @@ object CosmosClient {
     private const val BASE_BACKOFF_MS = 600L
     private const val JITTER_MS = 300L
 
+    // ---- authoritative STOP support ----
+    // Every open connection is tracked so STOP can sever in-flight HTTP at the
+    // socket, and the abort epoch makes the retry loop bail instead of
+    // re-sending a request the user just killed.
+    private val active = java.util.Collections.synchronizedSet(HashSet<HttpURLConnection>())
+    @Volatile private var abortEpoch = 0L
+
+    /** Sever every in-flight request NOW and make pending retries bail.
+     *  Called from the authoritative STOP path — safe from any thread. */
+    fun abortAll() {
+        abortEpoch += 1
+        val snapshot = synchronized(active) { active.toList() }
+        for (conn in snapshot) {
+            try {
+                conn.disconnect()
+            } catch (e: Exception) {
+                // already closed — fine
+            }
+        }
+    }
+
     fun getStatus(baseUrl: String, token: String): JSONObject =
         request("GET", baseUrl.trimEnd('/') + "/api/v1/status", token, null)
 
@@ -46,7 +67,11 @@ object CosmosClient {
         body: JSONObject?
     ): JSONObject {
         var lastExc: Exception? = null
+        val epochAtStart = abortEpoch
         for (attempt in 0 until MAX_ATTEMPTS) {
+            if (abortEpoch != epochAtStart) {
+                throw IOException("aborted by STOP")
+            }
             if (attempt > 0) {
                 val backoff = BASE_BACKOFF_MS * (1L shl (attempt - 1)) +
                     Random.nextLong(0, JITTER_MS)
@@ -78,6 +103,7 @@ object CosmosClient {
         body: JSONObject?
     ): JSONObject {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
+        active.add(conn)
         conn.requestMethod = method
         conn.connectTimeout = 10_000
         conn.readTimeout = 30_000
@@ -104,6 +130,7 @@ object CosmosClient {
             }
             return parsed
         } finally {
+            active.remove(conn)
             conn.disconnect()
         }
     }
