@@ -12,8 +12,14 @@
         <!-- Local development. -->
         <domain includeSubdomains="false">localhost</domain>
         <domain includeSubdomains="false">127.0.0.1</domain>
-        <!-- Tailscale MagicDNS names (traffic is WireGuard-encrypted on the
-             wire even when the HTTP layer is cleartext). -->
+        <!-- Tailscale: the app dials the server by its Tailscale IP (kc-pc =
+             100.103.9.112), NOT by a *.ts.net MagicDNS name, so the IP itself
+             must be whitelisted or the road/LTE connection is refused. This is
+             the fix for the 2026-08-24 "failing to connect" — the scoped config
+             listed ts.net names but not the IP the app actually uses. Traffic is
+             WireGuard-encrypted end to end, so cleartext HTTP inside it is fine. -->
+        <domain includeSubdomains="false">100.103.9.112</domain>
+        <!-- Tailscale MagicDNS names (in case a name is ever used instead). -->
         <domain includeSubdomains="true">ts.net</domain>
     </domain-config>
 </network-security-config>
