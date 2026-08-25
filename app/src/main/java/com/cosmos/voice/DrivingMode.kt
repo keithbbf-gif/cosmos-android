@@ -93,7 +93,7 @@ object VoiceGrammar {
         phrases += DICTATE_DONE
         phrases += SAY_AGAIN
         phrases += setOf("stop listening", "boot up")
-        phrases += "cosmos"
+        phrases += setOf("cosmos", "hey cosmos")
         phrases += "[unk]"
         return JSONArray(phrases.toList()).toString()
     }
@@ -108,11 +108,29 @@ object VoiceGrammar {
     private fun tokens(norm: String): List<String> =
         if (norm.isBlank()) emptyList() else norm.split(" ")
 
-    /** "cosmos status" -> "status": an optional address/wake word, nothing more.
-     *  Driving mode is always-listening, so the wake word is never REQUIRED. */
+    /**
+     * Wake-word address forms: "cosmos ..." / "hey cosmos ..." (plus the
+     * okay/ok variants Vosk tends to hear). In WAKE mode hasWake GATES every
+     * send — an utterance without it is dropped on the phone. In TAP/PTT
+     * capture the address stays optional ("cosmos status" still works).
+     */
+    fun hasWake(norm: String): Boolean {
+        val t = tokens(norm)
+        if (t.isEmpty()) return false
+        if (t[0] == "cosmos") return true
+        return t.size >= 2 && (t[0] == "hey" || t[0] == "okay" || t[0] == "ok") && t[1] == "cosmos"
+    }
+
+    /** Remove the wake-word address and return the remainder — "" for a bare
+     *  wake ("cosmos" / "hey cosmos" alone). Unchanged when no wake present. */
     fun stripWake(norm: String): String {
         val t = tokens(norm)
-        return if (t.size > 1 && t[0] == "cosmos") t.drop(1).joinToString(" ") else norm
+        return when {
+            t.size >= 2 && (t[0] == "hey" || t[0] == "okay" || t[0] == "ok") && t[1] == "cosmos" ->
+                t.drop(2).joinToString(" ")
+            t.isNotEmpty() && t[0] == "cosmos" -> t.drop(1).joinToString(" ")
+            else -> norm
+        }
     }
 
     /** Is this utterance an affirmative answer to a pending confirm? */

@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.media.AudioManager
+import android.media.ToneGenerator
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.Bundle
@@ -34,7 +35,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -81,26 +81,44 @@ import java.util.UUID
 /**
  * ======================== THE MIC STATE MACHINE ========================
  *
- *   OFF            default. The mic is closed. NOTHING opens it except an
- *                  explicit user action (tap, hold, or the confirmed
- *                  CONTINUOUS opt-in). Not launch, not reconnect, not a
- *                  server message, not a watchdog, not a retry.
- *   LISTENING_T2T  tap-to-talk (the default gesture): one tap captures ONE
- *                  utterance, auto-endpoints on Vosk final / ~1s silence,
- *                  then returns to OFF.
- *   LISTENING_PTT  push-to-talk: hold the mic button — press opens the mic,
- *                  release endpoints and sends. Back to OFF.
- *   CONTINUOUS     always-listening. Entered ONLY through the two-step
- *                  opt-in (button + confirm dialog); a persistent red
- *                  "LIVE" banner shows the whole time. Exits via STOP.
+ * MASTER MIC TOGGLE (the authoritative control):
+ *   MIC OFF  truly off. Vosk stopped, AudioRecord released, the userStopped
+ *            hard gate set. NO watchdog, retry, endpoint, reconnect, or
+ *            control message may start the mic. Remote mic_off and STOP
+ *            (button / notification / spoken) all land here.
+ *   MIC ON   an explicit user tap on the toggle — the ONLY thing that
+ *            clears the stop gate. What ON means depends on the MODE:
+ *
+ *   MicMode.WAKE (DEFAULT — the hands-free driving mode)
+ *            Vosk runs continuously and decodes LOCALLY. An utterance is
+ *            only SENT to COSMOS when it starts with the wake word
+ *            ("cosmos" / "hey cosmos"); the wake word is stripped and the
+ *            remainder is the command. EVERYTHING ELSE IS DROPPED ON THE
+ *            PHONE — never sent, never queued, never spends. After a
+ *            reply, a ~10s follow-up window accepts ONE utterance without
+ *            the wake word (natural back-and-forth), then gating resumes.
+ *   MicMode.TAP  tap-to-talk: one tap captures ONE utterance, auto-
+ *            endpoints on Vosk final / ~1s silence, then mic idle.
+ *   MicMode.PTT  push-to-talk: hold the mic button; release sends.
+ *
+ * MicState is the REALITY of the mic right now:
+ *   OFF            closed (master off, or TAP/PTT idle between captures)
+ *   LISTENING_T2T  one-utterance capture (TAP mode)
+ *   LISTENING_PTT  held capture (PTT mode)
+ *   LISTENING_WAKE continuous local decode, wake-word gated (WAKE mode)
  *
  * STOP (big red button, notification action, remote mic_off, spoken "stop")
- * is AUTHORITATIVE: from any state -> OFF; kills recognizer, TTS, in-flight
- * HTTP, and the local queue; sets userStopped so every watchdog/retry is a
- * no-op until the user explicitly starts the mic again.
+ * is AUTHORITATIVE: master OFF from any state; kills recognizer, TTS,
+ * in-flight HTTP, and the local queue; sets userStopped so every watchdog/
+ * retry is a no-op until the user explicitly toggles MIC ON again.
+ * The old "CONTINUOUS mode that sent every utterance" is REMOVED — the
+ * wake-word gate replaces it (that mode was the ambient-capture flood).
  * =======================================================================
  */
-enum class MicState { OFF, LISTENING_T2T, LISTENING_PTT, CONTINUOUS }
+enum class MicState { OFF, LISTENING_T2T, LISTENING_PTT, LISTENING_WAKE }
+
+/** How the mic captures while the master toggle is ON. Persisted. */
+enum class MicMode { WAKE, TAP, PTT }
 
 /** Observable UI state (plain Compose state holders, read via .value). */
 class AppState {
@@ -148,13 +166,19 @@ class AppState {
     // TTS rate multiplier, 0.5..2.0.
     val speechRate = mutableStateOf(1.0f)
 
-    // Two-step CONTINUOUS opt-in: step 1 sets this, step 2 is the dialog's
-    // explicit confirm. Nothing else can enter CONTINUOUS.
-    val showContinuousConfirm = mutableStateOf(false)
+    // ---- master mic + mode ----
+    // The single authoritative MIC ON / MIC OFF toggle. Persisted as a
+    // remembered choice, but the mic NEVER auto-starts on launch/reboot —
+    // turning it ON is always an explicit user tap in this session.
+    val masterOn = mutableStateOf(false)
+    // WAKE (default, hands-free) | TAP | PTT. Persisted.
+    val micMode = mutableStateOf(MicMode.WAKE)
+    // Follow-up window open: ONE utterance is accepted without the wake word.
+    val followUp = mutableStateOf(false)
 }
 
 /** The one visual phase the mic button + big label reflect. Priority when
- *  several are true at once (continuous keeps the mic hot): SPEAKING >
+ *  several are true at once (WAKE mode keeps the mic hot): SPEAKING >
  *  THINKING > LISTENING > IDLE. */
 enum class VoicePhase { IDLE, LISTENING, THINKING, SPEAKING }
 
@@ -216,8 +240,7 @@ class MainActivity : ComponentActivity() {
     // true after the user hits STOP (button, notification, spoken "stop", or
     // remote mic_off): the mic must STAY off. Every watchdog / restart timer /
     // deferred start NO-OPs while this is set — a hard stop is a hard stop.
-    // Cleared ONLY by an explicit user start (tap, hold, or the confirmed
-    // CONTINUOUS opt-in).
+    // Cleared ONLY by the explicit MIC ON toggle (setMasterMic(true)).
     @Volatile private var userStopped = false
 
     // What the user asked the mic to become when the permission prompt fired;
@@ -229,16 +252,32 @@ class MainActivity : ComponentActivity() {
     // deferred start must NOT open a mic nobody is holding.
     @Volatile private var pttHeld = false
 
-    private val continuous: Boolean
-        get() = state.micState.value == MicState.CONTINUOUS
+    // True while WAKE-mode hands-free listening is live (the mic is hot but
+    // every utterance without the wake word is dropped on the phone).
+    private val handsFree: Boolean
+        get() = state.micState.value == MicState.LISTENING_WAKE
+
+    // ---- follow-up window (WAKE mode) ----
+    // After a spoken reply, ONE utterance within this window is accepted
+    // without the wake word. Also opened (shorter) by a bare "cosmos".
+    @Volatile private var followUpUntilMs = 0L
+    private var followUpJob: Job? = null
+
+    // Audible wake-heard tick (media-routed — reaches BT headphones).
+    private var toneGen: ToneGenerator? = null
 
     private val micPermission =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-            val target = pendingStart ?: MicState.LISTENING_T2T
+            val target = pendingStart ?: micTargetForMode()
             pendingStart = null
             if (granted) {
                 if (!userStopped) startListening(target)
             } else {
+                // Master ON requires the permission — revert the toggle so the
+                // UI never claims a mic it cannot open.
+                if (state.masterOn.value && state.micMode.value == MicMode.WAKE) {
+                    setMasterMic(false, "permission denied")
+                }
                 log("Mic permission denied — voice input is disabled until granted.")
             }
         }
@@ -274,6 +313,17 @@ class MainActivity : ComponentActivity() {
         // headset over A2DP.
         state.phoneMicOn.value = prefs.getBoolean("phone_mic", true)
 
+        // Master mic + mode. The MODE is restored; the master toggle is only
+        // REMEMBERED — the app always comes up MIC OFF, and the user's
+        // explicit tap on the toggle is what opens the mic. Never on launch,
+        // never on reboot, never on reconnect.
+        state.micMode.value = try {
+            MicMode.valueOf(prefs.getString("mic_mode", MicMode.WAKE.name) ?: MicMode.WAKE.name)
+        } catch (e: Exception) {
+            MicMode.WAKE
+        }
+        val rememberedMicOn = prefs.getBoolean("master_mic_on", false)
+
         state.stream.value = prefs.getString("stream", "plumbing") ?: "plumbing"
         state.verbosity.value = prefs.getString("verbosity", "normal") ?: "normal"
         state.speechRate.value = prefs.getFloat("speech_rate", 1.0f)
@@ -300,14 +350,7 @@ class MainActivity : ComponentActivity() {
                     override fun onDone(utteranceId: String?) {
                         ttsSpeaking = false
                         currentUtteranceKind = ""
-                        // CONTINUOUS: the recognizer must never silently stay
-                        // dead after we finish talking — kick it back on if it
-                        // died. (No-op in every other state, and while stopped.)
-                        runOnUiThread {
-                            state.speaking.value = false
-                            updateMicService()
-                            if (continuous) restartMicIfNeeded()
-                        }
+                        runOnUiThread { onTtsFinished(utteranceId ?: "") }
                     }
 
                     @Deprecated("Deprecated in Java")
@@ -341,9 +384,8 @@ class MainActivity : ComponentActivity() {
                     onStop = { performStop("STOP button") },
                     onConfirm = { confirmPending() },
                     onSave = { saveSettings() },
-                    onContinuousRequest = { requestContinuous() },
-                    onContinuousConfirm = { confirmContinuous() },
-                    onContinuousDismiss = { state.showContinuousConfirm.value = false },
+                    onMasterToggle = { setMasterMic(!state.masterOn.value, "MIC toggle") },
+                    onMode = { m -> setMicMode(m) },
                     onHaptics = { on -> setHaptics(on) },
                     onDictate = { setDictateMode(!state.dictateMode.value) },
                     onPhoneMic = { on -> setPhoneMic(on) },
@@ -358,8 +400,12 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        log("COSMOS Voice v${BuildConfig.VERSION_NAME} — tap Talk for one utterance, " +
-            "hold for push-to-talk. STOP always wins.")
+        log("COSMOS Voice v${BuildConfig.VERSION_NAME} — MIC ON = hands-free: say " +
+            "\"Cosmos ...\" and only that is sent; everything else is decoded on the " +
+            "phone and dropped. STOP always wins.")
+        if (rememberedMicOn) {
+            log("Mic was ON last session — tap MIC ON to resume (it never auto-starts).")
+        }
     }
 
     override fun onDestroy() {
@@ -367,6 +413,13 @@ class MainActivity : ComponentActivity() {
         pollJob?.cancel()
         controlJob?.cancel()
         endpointJob?.cancel()
+        followUpJob?.cancel()
+        try {
+            toneGen?.release()
+        } catch (e: Exception) {
+            // best-effort
+        }
+        toneGen = null
         netScope.cancel()
         netCallback?.let { cb ->
             try {
@@ -395,6 +448,15 @@ class MainActivity : ComponentActivity() {
         userStopped = true
         pttHeld = false
         pendingStart = null
+        // STOP and MIC OFF are the SAME state: the master toggle reads OFF
+        // after any stop, however it arrived (button, voice, remote mic_off).
+        if (state.masterOn.value) {
+            state.masterOn.value = false
+            getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+                .putBoolean("master_mic_on", false)
+                .apply()
+        }
+        closeFollowUp()
         endpointJob?.cancel()
         pollJob?.cancel()
         pollJob = null
@@ -443,7 +505,8 @@ class MainActivity : ComponentActivity() {
         val speaking = state.speaking.value
         val needed = st != MicState.OFF || speaking
         val label = when {
-            st == MicState.CONTINUOUS -> "LIVE — listening continuously. Tap STOP to end."
+            st == MicState.LISTENING_WAKE ->
+                "Hands-free — only \"Cosmos ...\" is sent. Tap STOP to end."
             st == MicState.LISTENING_PTT -> "Listening (hold-to-talk)"
             st == MicState.LISTENING_T2T -> "Listening (one utterance)"
             speaking -> "Speaking"
@@ -487,14 +550,10 @@ class MainActivity : ComponentActivity() {
                             updateMicService()
                         }
                     },
-                    onDone = { _ ->
+                    onDone = { id ->
                         ttsSpeaking = false
                         currentUtteranceKind = ""
-                        runOnUiThread {
-                            state.speaking.value = false
-                            updateMicService()
-                            if (continuous) restartMicIfNeeded()
-                        }
+                        runOnUiThread { onTtsFinished(id) }
                     }
                 )
                 engine.init(this@MainActivity)
@@ -582,9 +641,23 @@ class MainActivity : ComponentActivity() {
         updateMicService()
     }
 
-    /** Short spoken status cue — continuous mode only (silent at the desk). */
+    /** Short spoken status cue — hands-free mode only (silent at the desk). */
     private fun cue(text: String) {
-        if (continuous) speak(text, kind = "cue")
+        if (handsFree) speak(text, kind = "cue")
+    }
+
+    /** Main thread. Runs after any TTS utterance finishes playing: clears the
+     *  speaking phase, keeps the WAKE-mode recognizer alive, and — after a
+     *  spoken REPLY in WAKE mode — opens the follow-up window so the user can
+     *  answer ONCE without repeating the wake word. */
+    private fun onTtsFinished(utteranceId: String) {
+        state.speaking.value = false
+        updateMicService()
+        if (handsFree) {
+            restartMicIfNeeded()
+            // utteranceId is "$kind-<ts>" — see speak().
+            if (utteranceId.substringBefore("-") == "reply") openFollowUp(FOLLOW_UP_MS)
+        }
     }
 
     /** Re-speak the last normal reply (SAY AGAIN, button or voice). */
@@ -598,37 +671,130 @@ class MainActivity : ComponentActivity() {
         speak(last)
     }
 
-    // ---------- CONTINUOUS (two-step opt-in) ----------
+    // ---------- MASTER MIC (the authoritative toggle) ----------
 
-    /** Step 1: the user asked for continuous listening. Nothing turns on yet —
-     *  the confirm dialog (step 2) is the only way in. Also reachable by
-     *  voice ("driving mode on"), which still requires the on-screen confirm. */
-    private fun requestContinuous() {
-        if (continuous) return
-        state.showContinuousConfirm.value = true
+    /**
+     * The single MIC ON / MIC OFF control.
+     * OFF is the SAME authoritative teardown as STOP (performStop is reused):
+     * recognizer killed, AudioRecord released, in-flight HTTP severed, queue
+     * cleared, userStopped set — nothing restarts the mic afterwards.
+     * ON is the ONE explicit user action that clears the stop gate. What it
+     * starts depends on the mode: WAKE opens the hands-free wake-word
+     * listener; TAP/PTT just arm the gesture (the mic opens per tap/hold).
+     */
+    private fun setMasterMic(on: Boolean, source: String) {
+        if (!on) {
+            if (!state.masterOn.value && state.micState.value == MicState.OFF) return
+            performStop(source) // also flips masterOn off + persists
+            return
+        }
+        if (state.masterOn.value) return
+        userStopped = false // the explicit ON is what re-arms the mic
+        state.masterOn.value = true
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putBoolean("master_mic_on", true)
+            .apply()
+        when (state.micMode.value) {
+            MicMode.WAKE -> {
+                window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+                log("MIC ON — hands-free. Say \"Cosmos ...\"; everything else is " +
+                    "decoded on the phone and dropped.")
+                speak("Mic on. Say cosmos, then your command.")
+                startPolling()
+                ensureMicOn(MicState.LISTENING_WAKE)
+            }
+            MicMode.TAP -> log("MIC ON — tap the circle to talk (one utterance per tap).")
+            MicMode.PTT -> log("MIC ON — hold the circle to talk, release to send.")
+        }
+        updateMicService()
     }
 
-    /** Step 2: the explicit confirm. This is the ONLY entry to CONTINUOUS. */
-    private fun confirmContinuous() {
-        state.showContinuousConfirm.value = false
-        if (continuous) return
-        // End any one-shot capture cleanly first so the state moves OFF ->
-        // CONTINUOUS through the front door.
-        if (state.micState.value != MicState.OFF) {
-            endpointJob?.cancel()
+    /** Mode selector (WAKE default / TAP / PTT). Persisted. Switching while
+     *  the master is ON moves the live mic between hands-free and gesture
+     *  capture without touching the master toggle. */
+    private fun setMicMode(m: MicMode) {
+        if (state.micMode.value == m) return
+        state.micMode.value = m
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putString("mic_mode", m.name)
+            .apply()
+        log("MODE: ${m.name} — " + when (m) {
+            MicMode.WAKE -> "hands-free, wake-word gated (\"Cosmos ...\")."
+            MicMode.TAP -> "tap = one utterance."
+            MicMode.PTT -> "hold = talk, release = send."
+        })
+        if (!state.masterOn.value) return
+        // Master is ON: move the live mic to match the new mode.
+        closeFollowUp()
+        if (m == MicMode.WAKE) {
+            if (state.micState.value != MicState.OFF) {
+                endpointJob?.cancel()
+                voice?.stop()
+                state.micState.value = MicState.OFF
+                state.partial.value = ""
+            }
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            startPolling()
+            ensureMicOn(MicState.LISTENING_WAKE)
+        } else if (state.micState.value == MicState.LISTENING_WAKE) {
             voice?.stop()
             state.micState.value = MicState.OFF
             state.partial.value = ""
+            pollJob?.cancel()
+            pollJob = null
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            updateMicService()
         }
-        userStopped = false // explicit opt-in re-arms the mic
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        log("CONTINUOUS LISTENING ON — the red LIVE banner stays up; tap STOP to end.")
-        speak("Continuous listening on.")
-        startPolling()
-        ensureMicOn(MicState.CONTINUOUS)
     }
 
-    /** Poll /status every ~20s while continuous: detects signal coming back
+    /** The MicState a fresh capture should enter for the current mode. */
+    private fun micTargetForMode(): MicState = when (state.micMode.value) {
+        MicMode.WAKE -> MicState.LISTENING_WAKE
+        MicMode.TAP -> MicState.LISTENING_T2T
+        MicMode.PTT -> MicState.LISTENING_PTT
+    }
+
+    // ---------- follow-up window (WAKE mode) ----------
+
+    /** Open the window: the NEXT utterance (one only) is accepted without the
+     *  wake word. Shown in the UI; closed by consumption, timeout, or STOP. */
+    private fun openFollowUp(ms: Long) {
+        if (!handsFree) return
+        followUpUntilMs = System.currentTimeMillis() + ms
+        state.followUp.value = true
+        followUpJob?.cancel()
+        followUpJob = lifecycleScope.launch {
+            delay(ms)
+            if (followUpUntilMs != 0L && System.currentTimeMillis() >= followUpUntilMs) {
+                followUpUntilMs = 0L
+                state.followUp.value = false
+                log("(follow-up window closed — say \"Cosmos ...\" again)")
+            }
+        }
+    }
+
+    private fun closeFollowUp() {
+        followUpUntilMs = 0L
+        followUpJob?.cancel()
+        state.followUp.value = false
+    }
+
+    private fun followUpOpen(): Boolean = System.currentTimeMillis() < followUpUntilMs
+
+    /** Wake word heard: short haptic tick + audible tick (media-routed, so it
+     *  lands in Bluetooth headphones) BEFORE the command is captured/sent —
+     *  eyes-free proof the phone is now taking a command. */
+    private fun wakeTick() {
+        haptics.micStart()
+        try {
+            if (toneGen == null) toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 85)
+            toneGen?.startTone(ToneGenerator.TONE_PROP_ACK, 120)
+        } catch (e: Exception) {
+            // the tone is decoration — never let it break the voice path
+        }
+    }
+
+    /** Poll /status every ~20s while hands-free: detects signal coming back
      *  and flushes the offline queue. Cancelled by STOP. */
     private fun startPolling() {
         pollJob?.cancel()
@@ -868,8 +1034,10 @@ class MainActivity : ComponentActivity() {
 
     // ---------- voice model ----------
 
-    /** Model download NEVER auto-starts the mic afterwards — the user taps
-     *  Talk again when it lands (the invariant beats the convenience). */
+    /** Model download never auto-starts the mic on its own. ONE exception:
+     *  when a standing explicit MIC ON (WAKE mode) triggered this download,
+     *  completing it finishes THAT user action — same class as the permission
+     *  grant. Launch/reboot/reconnect still never start the mic. */
     private fun downloadModel() {
         val st = state.modelStatus.value
         if (st == "downloading" || st == "unzipping") return
@@ -886,7 +1054,17 @@ class MainActivity : ComponentActivity() {
                 }
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "ready (not loaded)"
-                    log("Voice model ready. Tap Talk to start.")
+                    if (state.masterOn.value && state.micMode.value == MicMode.WAKE &&
+                        !userStopped
+                    ) {
+                        // The explicit MIC ON is still standing — the download
+                        // was the missing piece of that user action; finish it.
+                        log("Voice model ready — starting hands-free listening " +
+                            "(completing your MIC ON).")
+                        ensureMicOn(MicState.LISTENING_WAKE)
+                    } else {
+                        log("Voice model ready. Tap the mic to start.")
+                    }
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -915,11 +1093,16 @@ class MainActivity : ComponentActivity() {
                             state.partial.value = p
                             // ================== BARGE-IN ==================
                             // The user started talking while we were talking:
-                            // stop the TTS so they can be heard. Exception:
+                            // stop the TTS so they can be heard. Exceptions:
                             // while the CONFIRM prompt is playing we do NOT
                             // barge-in (echo guard — the phone can hear its
-                            // own prompt).
-                            if (p.isNotBlank() && ttsSpeaking && currentUtteranceKind != "confirm") {
+                            // own prompt); and in WAKE mode ambient speech
+                            // must not cut replies — barging needs the wake
+                            // word in the partial, or an open follow-up window.
+                            if (p.isNotBlank() && ttsSpeaking && currentUtteranceKind != "confirm" &&
+                                (state.micState.value != MicState.LISTENING_WAKE ||
+                                    p.contains("cosmos") || followUpOpen())
+                            ) {
                                 bargeInStopTts()
                             }
                         }
@@ -928,8 +1111,8 @@ class MainActivity : ComponentActivity() {
                     onErr = { msg ->
                         runOnUiThread {
                             log("VOICE ERROR: $msg")
-                            if (continuous && !userStopped) {
-                                // CONTINUOUS: never let the recognizer die
+                            if (handsFree && !userStopped) {
+                                // WAKE mode: never let the recognizer die
                                 // silently. Tear down, wait a beat, restart.
                                 voice?.stop()
                                 lifecycleScope.launch {
@@ -956,14 +1139,14 @@ class MainActivity : ComponentActivity() {
                 withContext(Dispatchers.Main) {
                     state.modelStatus.value = "error: ${e.message?.take(80)}"
                     log("MODEL LOAD FAILED: ${e.message}")
-                    if (continuous && !userStopped) {
-                        // CONTINUOUS opt-in is still live: retry in a few
+                    if (handsFree && !userStopped) {
+                        // The WAKE opt-in is still live: retry in a few
                         // seconds (STOP makes this a no-op). Both conditions
                         // are re-read after the delay — a STOP during the
                         // wait must end the retry, not just defer it.
                         lifecycleScope.launch {
                             delay(5_000)
-                            if (userStopped || state.micState.value != MicState.CONTINUOUS) return@launch
+                            if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return@launch
                             restartMicIfNeeded()
                         }
                     }
@@ -1019,26 +1202,35 @@ class MainActivity : ComponentActivity() {
             endpointJob?.cancel()
             state.micState.value = MicState.OFF
             updateMicService()
-            if (continuous) scheduleMicRetry("recognizer rebuild failed")
+            if (handsFree) scheduleMicRetry("recognizer rebuild failed")
         }
     }
 
     // ---------- mic (user gestures) ----------
 
     /**
-     * TAP — the default gesture:
-     *   OFF        -> LISTENING_T2T (one utterance, then auto-OFF)
-     *   T2T        -> endpoint NOW (Vosk flushes its final -> sent) and OFF
-     *   PTT        -> no-op (the release handles it)
-     *   CONTINUOUS -> barge-in only (STOP is the exit, and it is right there)
+     * TAP on the mic circle — gated by the MASTER toggle (a tap while MIC is
+     * OFF opens nothing; the toggle is the only way to arm the mic):
+     *   OFF (master ON)  -> per mode: TAP starts a one-utterance capture,
+     *                       WAKE recovers a dead hands-free mic, PTT hints
+     *   T2T              -> endpoint NOW (Vosk flushes the final -> sent)
+     *   PTT              -> no-op (the release handles it)
+     *   WAKE             -> barge-in only (speech gating handles the rest)
      * Any tap silences the TTS (barge-in) first.
      */
     private fun onMicTap() {
         bargeInStopTts()
         when (state.micState.value) {
             MicState.OFF -> {
-                userStopped = false // explicit user start re-arms the mic
-                ensureMicOn(MicState.LISTENING_T2T)
+                if (!state.masterOn.value) {
+                    log("MIC is OFF — tap the MIC ON toggle first.")
+                    return
+                }
+                when (state.micMode.value) {
+                    MicMode.TAP -> ensureMicOn(MicState.LISTENING_T2T)
+                    MicMode.WAKE -> ensureMicOn(MicState.LISTENING_WAKE)
+                    MicMode.PTT -> log("(PTT mode — hold the circle to talk)")
+                }
             }
             MicState.LISTENING_T2T -> {
                 endpointJob?.cancel()
@@ -1051,18 +1243,22 @@ class MainActivity : ComponentActivity() {
                 log("(endpointed by tap)")
             }
             MicState.LISTENING_PTT -> { /* release handles it */ }
-            MicState.CONTINUOUS -> { /* barge-in done above; STOP exits */ }
+            MicState.LISTENING_WAKE -> { /* barge-in done above; gating decides */ }
         }
     }
 
     /** HOLD (push-to-talk): press opens the mic. Fires from a long-press on
-     *  the mic button. A hold during T2T upgrades the capture to PTT
-     *  semantics (release = send). */
+     *  the mic button. Gated by the MASTER toggle. A hold during T2T upgrades
+     *  the capture to PTT semantics (release = send). */
     private fun onPttStart() {
         when (state.micState.value) {
             MicState.OFF -> {
+                if (!state.masterOn.value) {
+                    log("MIC is OFF — tap the MIC ON toggle first.")
+                    return
+                }
+                if (state.micMode.value == MicMode.WAKE) return // tap recovers wake
                 bargeInStopTts()
-                userStopped = false
                 pttHeld = true
                 ensureMicOn(MicState.LISTENING_PTT)
             }
@@ -1073,7 +1269,7 @@ class MainActivity : ComponentActivity() {
                 updateMicService()
                 log("(hold — release to send)")
             }
-            else -> { /* PTT already, or CONTINUOUS — nothing */ }
+            else -> { /* PTT already, or WAKE — nothing */ }
         }
     }
 
@@ -1131,8 +1327,9 @@ class MainActivity : ComponentActivity() {
                 if (target == MicState.LISTENING_T2T) armT2tEndpoint()
                 log(
                     when (target) {
-                        MicState.CONTINUOUS ->
-                            "Listening continuously (LIVE)... tap STOP to end."
+                        MicState.LISTENING_WAKE ->
+                            "Hands-free listening... say \"Cosmos ...\" — everything " +
+                                "else is dropped on the phone. STOP or the toggle ends it."
                         MicState.LISTENING_PTT ->
                             "Listening (hold-to-talk)... release to send."
                         else ->
@@ -1140,7 +1337,7 @@ class MainActivity : ComponentActivity() {
                                 "speak, pause to send — one utterance, then off."
                     }
                 )
-                if (target == MicState.CONTINUOUS) cue("Listening.")
+                if (target == MicState.LISTENING_WAKE) cue("Listening.")
             } catch (e: Exception) {
                 log("MIC START FAILED: ${e.message}")
                 state.micState.value = MicState.OFF
@@ -1184,32 +1381,32 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    /** CONTINUOUS watchdog: if the recognizer is not running, restart it.
+    /** WAKE-mode watchdog: if the recognizer is not running, restart it.
      *  Called after every TTS utterance finishes and after voice errors.
      *  A NO-OP in every other state and, always, while userStopped is set —
-     *  this is a keep-alive for the explicit opt-in, never an auto-start. */
+     *  this is a keep-alive for the explicit MIC ON, never an auto-start. */
     private fun restartMicIfNeeded() {
         if (userStopped) return // the user said STOP — the mic stays off
-        if (state.micState.value != MicState.CONTINUOUS) return
+        if (state.micState.value != MicState.LISTENING_WAKE) return
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) return
         val v = voice
         if (v == null || !v.isLoaded) {
             if (!ModelManager.isReady(this)) {
-                // Model vanished mid-session: exit continuous instead of
+                // Model vanished mid-session: exit hands-free instead of
                 // looping a download — the user restarts when it is back.
-                log("CONTINUOUS: voice model missing — going OFF.")
+                log("WAKE: voice model missing — going OFF.")
                 state.micState.value = MicState.OFF
                 updateMicService()
                 return
             }
             ensureEngineLoaded {
-                if (userStopped || state.micState.value != MicState.CONTINUOUS) return@ensureEngineLoaded
+                if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return@ensureEngineLoaded
                 try {
                     applyMicRoute()
                     // Last-gate re-check before opening the mic (STOP races).
-                    if (userStopped || state.micState.value != MicState.CONTINUOUS) return@ensureEngineLoaded
+                    if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return@ensureEngineLoaded
                     voice?.start(currentGrammar())
                     updateMicService()
                     log("(mic auto-restarted after model load)")
@@ -1223,7 +1420,7 @@ class MainActivity : ComponentActivity() {
         try {
             applyMicRoute()
             // Last-gate re-check before opening the mic (STOP races).
-            if (userStopped || state.micState.value != MicState.CONTINUOUS) return
+            if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return
             v.start(currentGrammar())
             log("(mic auto-restarted)")
         } catch (e: Exception) {
@@ -1232,26 +1429,27 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun scheduleMicRetry(msg: String) {
-        // Retry ONLY while the CONTINUOUS opt-in is still live AND the user
-        // has not stopped — guard BOTH: a stop can flip either flag first,
-        // and a retry loop must never outlive the state it keeps alive.
-        if (userStopped || state.micState.value != MicState.CONTINUOUS) return
+        // Retry ONLY while WAKE hands-free is still live AND the user has
+        // not stopped — guard BOTH: a stop can flip either flag first, and
+        // a retry loop must never outlive the state it keeps alive.
+        if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return
         log("$msg — retrying in 2s")
         lifecycleScope.launch {
             delay(2_000)
             // Re-check after the async gap; restartMicIfNeeded re-checks
             // both again, but a STOP during the delay must end the loop here.
-            if (userStopped || state.micState.value != MicState.CONTINUOUS) return@launch
+            if (userStopped || state.micState.value != MicState.LISTENING_WAKE) return@launch
             restartMicIfNeeded()
         }
     }
 
     // ---------- transcript handling ----------
 
-    /** One-shot capture done (T2T/PTT): return to OFF. No-op in CONTINUOUS. */
+    /** One-shot capture done (T2T/PTT): return to OFF. No-op in WAKE mode
+     *  (the hands-free mic stays hot; gating decides what is sent). */
     private fun stopAfterUtterance() {
         val st = state.micState.value
-        if (st == MicState.CONTINUOUS || st == MicState.OFF) return
+        if (st == MicState.LISTENING_WAKE || st == MicState.OFF) return
         endpointJob?.cancel()
         voice?.stop()
         state.micState.value = MicState.OFF
@@ -1287,6 +1485,54 @@ class MainActivity : ComponentActivity() {
         if (raw.isBlank()) return
         val norm = VoiceGrammar.normalize(raw)
 
+        // ==================== WAKE-WORD GATE (WAKE mode) ====================
+        // The ambient-capture fix: in hands-free mode EVERY utterance is
+        // decoded locally, and only one that carries the wake word ("cosmos" /
+        // "hey cosmos") — or the ONE allowed follow-up while the window is
+        // open — goes any further. Everything else is dropped RIGHT HERE:
+        // never classified, never sent, never queued, never spoken, never
+        // spends. Pass-through WITHOUT the wake word, by design:
+        //   - a pending confirm (the yes/no answer to a prompt WE spoke)
+        //   - dictate mode (entered only through a wake-worded "ask")
+        //   - a bare "stop" while speaking/thinking (the safe direction —
+        //     it can only turn things off)
+        var text = raw
+        var normText = norm
+        if (state.micState.value == MicState.LISTENING_WAKE) {
+            when {
+                VoiceGrammar.hasWake(norm) -> {
+                    wakeTick() // wake word heard — tick BEFORE taking the command
+                    val rest = VoiceGrammar.stripWake(norm)
+                    if (rest.isBlank()) {
+                        // Bare "cosmos": open a command window — the next
+                        // utterance IS the command, no wake word needed.
+                        log("YOU: $raw")
+                        log("(wake word — listening for your command)")
+                        openFollowUp(COMMAND_WINDOW_MS)
+                        return
+                    }
+                    closeFollowUp()
+                    text = rest
+                    normText = rest
+                }
+                state.pendingConfirmId.value != null || state.dictateMode.value -> {
+                    // active exchange — pass through un-stripped
+                }
+                followUpOpen() -> {
+                    // The ONE follow-up: consume the window.
+                    closeFollowUp()
+                    log("(follow-up accepted)")
+                }
+                (ttsSpeaking || state.thinking.value) && VoiceGrammar.isStop(norm) -> {
+                    // "stop" mid-exchange passes — handled just below
+                }
+                else -> {
+                    log("(no wake word — dropped on the phone: \"${raw.take(48)}\")")
+                    return
+                }
+            }
+        }
+
         // Spoken authoritative STOP — checked BEFORE everything, including
         // the pending-confirm branch, so saying "stop" always stops: mic off,
         // speech killed, requests aborted, AND the pending nonce dropped
@@ -1294,7 +1540,7 @@ class MainActivity : ComponentActivity() {
         // swallow the stop word as a mere "cancel" answer. (The confirm
         // prompt text never contains the word "stop", so the echo guard is
         // not needed for this path.)
-        if (VoiceGrammar.isStop(norm)) {
+        if (VoiceGrammar.isStop(normText)) {
             log("YOU: $raw")
             performStop("voice")
             return
@@ -1312,7 +1558,7 @@ class MainActivity : ComponentActivity() {
                 return
             }
             log("YOU: $raw")
-            if (VoiceGrammar.isYes(norm)) {
+            if (VoiceGrammar.isYes(normText)) {
                 confirmPending()
             } else {
                 confirmExpireJob?.cancel()
@@ -1328,12 +1574,12 @@ class MainActivity : ComponentActivity() {
         log("YOU: $raw")
 
         // Local voice controls that never leave the phone.
-        if (VoiceGrammar.isSayAgain(norm)) {
+        if (VoiceGrammar.isSayAgain(normText)) {
             sayAgain()
             stopAfterUtterance()
             return
         }
-        if (VoiceGrammar.isNewSession(norm)) {
+        if (VoiceGrammar.isNewSession(normText)) {
             newSession()
             stopAfterUtterance()
             return
@@ -1342,49 +1588,53 @@ class MainActivity : ComponentActivity() {
         // ===================== RECOGNITION MODE SWITCH =====================
         // DICTATE mode: this final IS the dictated utterance (open decode).
         if (state.dictateMode.value) {
-            if (VoiceGrammar.isDictateDone(norm)) {
+            if (VoiceGrammar.isDictateDone(normText)) {
                 stopAfterUtterance() // stop FIRST so setDictateMode does not rebuild a live recognizer
                 setDictateMode(false)
                 return
             }
-            send(raw, null, quiet = false)
+            send(text, null, quiet = false)
             stopAfterUtterance() // one open utterance, then idle
             setDictateMode(false) // back to commands for the next tap
             return
         }
         // COMMAND mode: a bare "ask"/"dictate" opens the recognizer for free
         // speech (the grammar blocks arbitrary text, so the switch is explicit).
-        if (VoiceGrammar.isDictateStart(norm)) {
+        if (VoiceGrammar.isDictateStart(normText)) {
             setDictateMode(true)
             return
         }
 
-        // Voice control of continuous mode. ON still requires the on-screen
-        // confirm (two-step opt-in, no exceptions); OFF is a full STOP.
-        if (VoiceGrammar.isDrivingOff(norm)) {
+        // Voice control of hands-free. OFF is a full authoritative STOP;
+        // ON switches the mode (the utterance itself was an explicit user
+        // capture, so the gesture requirement is already met).
+        if (VoiceGrammar.isDrivingOff(normText)) {
             performStop("voice (driving mode off)")
             return
         }
-        if (VoiceGrammar.isDrivingOn(norm)) {
-            requestContinuous()
-            speak("Confirm continuous listening on the screen.")
-            stopAfterUtterance()
+        if (VoiceGrammar.isDrivingOn(normText)) {
+            if (handsFree) {
+                speak("Hands-free is already on.")
+            } else {
+                stopAfterUtterance()
+                setMicMode(MicMode.WAKE)
+            }
             return
         }
 
-        // Junk gate — BOTH modes: road noise, filler words, and fragments
+        // Junk gate — ALL modes: road noise, filler words, and fragments
         // with no real content and no COSMOS verb are dropped entirely.
-        if (VoiceGrammar.isJunk(norm)) {
+        if (VoiceGrammar.isJunk(normText)) {
             log("(ignored as noise: \"$raw\")")
             return
         }
-        if (continuous) {
-            // Everything else goes to COSMOS — the SERVER classifies it and
-            // returns `kind`; the SPOKEN reply is moderated in handleReply
-            // from that classification.
-            send(raw, null, quiet = !VoiceGrammar.startsWithKnownVerb(norm))
+        if (handsFree) {
+            // Passed the wake/follow-up gate: this IS a command for COSMOS —
+            // the SERVER classifies it and returns `kind`; the SPOKEN reply
+            // is moderated in handleReply from that classification.
+            send(text, null, quiet = false)
         } else {
-            send(raw, null, quiet = false)
+            send(text, null, quiet = false)
             stopAfterUtterance() // one utterance per tap/hold
         }
     }
@@ -1413,7 +1663,7 @@ class MainActivity : ComponentActivity() {
 
     /**
      * POST a transcript to COSMOS. `quiet` suppresses the pre-send "Got it,
-     * thinking." cue in continuous mode only. `action` tags the payload with a
+     * thinking." cue in hands-free mode only. `action` tags the payload with a
      * server-side action (e.g. "bootup").
      */
     private fun send(
@@ -1437,14 +1687,14 @@ class MainActivity : ComponentActivity() {
         val base = state.baseUrl.value.trim().trimEnd('/')
         if (base.isBlank()) {
             log("Set the server URL first.")
-            if (continuous) speak("No server URL is set.")
+            if (handsFree) speak("No server URL is set.")
             return
         }
         if (controlPaused) {
             log("(PAUSED by control — not sent: \"$transcript\")")
             return
         }
-        if (continuous && !quiet && confirmId == null) {
+        if (handsFree && !quiet && confirmId == null) {
             cue("Got it, thinking.")
         }
         haptics.sent()             // double-tick: recognized and on its way
@@ -1488,14 +1738,14 @@ class MainActivity : ComponentActivity() {
     private fun onSendFailed(transcript: String, confirmId: String?, body: JSONObject) {
         if (confirmId != null) {
             log("Confirm re-POST failed — nonce dropped (single-use, not queued).")
-            if (continuous) {
+            if (handsFree) {
                 speak("Couldn't reach COSMOS. The confirmation was not sent. Ask again when we're back online.")
             }
             return
         }
         if (!state.offlineQueueOn.value) {
             log("DISCARDED (send-now-or-discard): \"$transcript\"")
-            if (continuous) speak("Couldn't reach COSMOS. That was not saved.")
+            if (handsFree) speak("Couldn't reach COSMOS. That was not saved.")
             return
         }
         val dropped = queue.add(body.toString())
@@ -1504,7 +1754,7 @@ class MainActivity : ComponentActivity() {
             log("QUEUE FULL (${OfflineQueue.MAX_ITEMS}) — dropped $dropped oldest item(s).")
         }
         log("QUEUED offline (${queue.size} pending): \"$transcript\"")
-        if (continuous) {
+        if (handsFree) {
             speak("Saved, no signal. I'll send it when we're back.")
         }
     }
@@ -1597,7 +1847,7 @@ class MainActivity : ComponentActivity() {
                         state.pendingConfirmId.value = null
                         state.pendingTranscript.value = null
                         log("CONFIRM EXPIRED (${CONFIRM_TTL_MS / 1000}s) — nonce dropped.")
-                        if (continuous) speak("That confirmation expired.")
+                        if (handsFree) speak("That confirmation expired.")
                     }
                 }
                 // Two strong pulses: a consequential confirm is FELT, not just heard.
@@ -1635,10 +1885,10 @@ class MainActivity : ComponentActivity() {
         }
         val toSpeak: String? = when {
             spoken.isNotBlank() -> spoken
-            continuous && refused -> "COSMOS refused that."
-            continuous && o.has("http_status") ->
+            handsFree && refused -> "COSMOS refused that."
+            handsFree && o.has("http_status") ->
                 "Server error ${o.optInt("http_status")}."
-            continuous -> "Done."
+            handsFree -> "Done."
             else -> null
         }
         if (toSpeak != null) {
@@ -1691,6 +1941,14 @@ class MainActivity : ComponentActivity() {
 
         /** T2T: give up if nothing is heard at all for this long. */
         const val T2T_MAX_WAIT_MS = 8_000L
+
+        /** WAKE mode: follow-up window after a spoken reply — ONE utterance
+         *  is accepted without the wake word, then gating resumes. */
+        const val FOLLOW_UP_MS = 10_000L
+
+        /** WAKE mode: command window after a bare "cosmos" (wake heard, no
+         *  command yet) — the next utterance is the command. */
+        const val COMMAND_WINDOW_MS = 8_000L
     }
 }
 
@@ -1709,9 +1967,8 @@ fun AppScreen(
     onStop: () -> Unit,
     onConfirm: () -> Unit,
     onSave: () -> Unit,
-    onContinuousRequest: () -> Unit,
-    onContinuousConfirm: () -> Unit,
-    onContinuousDismiss: () -> Unit,
+    onMasterToggle: () -> Unit,
+    onMode: (MicMode) -> Unit,
     onHaptics: (Boolean) -> Unit,
     onDictate: () -> Unit,
     onPhoneMic: (Boolean) -> Unit,
@@ -1736,30 +1993,7 @@ fun AppScreen(
     val thinkColor = Color(0xFFF9A825)   // amber — waiting on the server
     val speakColor = Color(0xFF1565C0)   // blue — TTS talking
     val stopRed = Color(0xFFC62828)
-
-    // Two-step CONTINUOUS opt-in: the dialog IS step two.
-    if (state.showContinuousConfirm.value) {
-        AlertDialog(
-            onDismissRequest = onContinuousDismiss,
-            title = { Text("Keep the mic on continuously?") },
-            text = {
-                Text(
-                    "The microphone stays LIVE and everything heard goes to " +
-                        "COSMOS until you tap STOP. A red LIVE banner shows " +
-                        "the whole time."
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = onContinuousConfirm,
-                    colors = ButtonDefaults.buttonColors(containerColor = stopRed)
-                ) { Text("GO LIVE") }
-            },
-            dismissButton = {
-                TextButton(onClick = onContinuousDismiss) { Text("Cancel") }
-            }
-        )
-    }
+    val okGreen = Color(0xFF2E7D32)
 
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(modifier = Modifier.fillMaxSize().padding(12.dp)) {
@@ -1781,20 +2015,83 @@ fun AppScreen(
                 }
             }
 
-            // Persistent LIVE banner — continuous mode is never invisible.
-            if (mic == MicState.CONTINUOUS) {
+            // ============ MASTER MIC TOGGLE — the one control ============
+            // Unmistakable at a glance: green = hot (wake-gated), gray = off.
+            val masterOn = state.masterOn.value
+            Button(
+                onClick = onMasterToggle,
+                modifier = Modifier.fillMaxWidth().padding(top = 6.dp).height(72.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (masterOn) okGreen else Color(0xFF49454F)
+                )
+            ) {
+                Text(
+                    text = if (masterOn) {
+                        if (state.micMode.value == MicMode.WAKE)
+                            "MIC ON · say \"Cosmos …\""
+                        else "MIC ON"
+                    } else "MIC OFF — tap to turn on",
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            // Mode selector: WAKE (default, hands-free) / TAP / HOLD.
+            Row(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
+                MicMode.values().forEach { m ->
+                    val sel = state.micMode.value == m
+                    Button(
+                        onClick = { onMode(m) },
+                        modifier = Modifier.weight(1f).padding(horizontal = 2.dp).height(44.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (sel) Color(0xFF1565C0) else Color(0xFF49454F)
+                        )
+                    ) {
+                        Text(
+                            when (m) {
+                                MicMode.WAKE -> "WAKE"
+                                MicMode.TAP -> "TAP"
+                                MicMode.PTT -> "HOLD"
+                            },
+                            fontSize = 13.sp,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+
+            // Persistent hands-free banner — a hot mic is never invisible.
+            if (mic == MicState.LISTENING_WAKE) {
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .background(stopRed)
-                        .padding(vertical = 10.dp),
+                        .padding(top = 4.dp)
+                        .background(okGreen)
+                        .padding(vertical = 8.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
-                        text = "● LIVE — tap STOP to end",
+                        text = "● HANDS-FREE — only \"Cosmos …\" is sent",
                         color = Color.White,
                         fontWeight = FontWeight.Bold,
-                        fontSize = 18.sp
+                        fontSize = 16.sp
+                    )
+                }
+            }
+            // Follow-up window: ONE utterance accepted without the wake word.
+            if (state.followUp.value) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(thinkColor)
+                        .padding(vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "FOLLOW-UP — just speak, no wake word",
+                        color = Color.Black,
+                        fontWeight = FontWeight.Bold
                     )
                 }
             }
@@ -1918,29 +2215,17 @@ fun AppScreen(
                 }
             }
 
-            // BootUP + session controls + continuous entry.
+            // BootUP + session controls.
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
             ) {
                 Button(
                     onClick = onBootUp,
-                    modifier = Modifier.weight(1f).padding(end = 4.dp).height(52.dp),
+                    modifier = Modifier.weight(1f).height(52.dp),
                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1565C0))
                 ) {
                     Text("BootUP!", fontSize = 16.sp)
-                }
-                Button(
-                    onClick = onContinuousRequest,
-                    modifier = Modifier.weight(1f).padding(start = 4.dp).height(52.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (mic == MicState.CONTINUOUS) stopRed else Color(0xFF49454F)
-                    )
-                ) {
-                    Text(
-                        if (mic == MicState.CONTINUOUS) "LIVE" else "CONTINUOUS…",
-                        fontSize = 14.sp
-                    )
                 }
             }
             Row(
@@ -2042,10 +2327,10 @@ fun AppScreen(
                 ) {
                     Text(
                         text = when (mic) {
-                            MicState.OFF -> "TALK"
+                            MicState.OFF -> if (state.masterOn.value) "TALK" else "OFF"
                             MicState.LISTENING_T2T -> "LISTENING"
                             MicState.LISTENING_PTT -> "HOLDING"
-                            MicState.CONTINUOUS -> "LIVE"
+                            MicState.LISTENING_WAKE -> "WAKE"
                         },
                         color = Color.White,
                         fontSize = 18.sp,
@@ -2062,7 +2347,11 @@ fun AppScreen(
                 }
             }
             Text(
-                text = "tap = one utterance · hold = push-to-talk",
+                text = when (state.micMode.value) {
+                    MicMode.WAKE -> "say \"Cosmos …\" · tap the circle to interrupt speech"
+                    MicMode.TAP -> "tap = one utterance · hold = push-to-talk"
+                    MicMode.PTT -> "hold = talk · release = send"
+                },
                 style = MaterialTheme.typography.bodySmall,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth()
@@ -2080,11 +2369,16 @@ fun AppScreen(
             // Big glanceable state label — readable while driving.
             Text(
                 text = when (phase) {
-                    VoicePhase.LISTENING ->
-                        if (mic == MicState.CONTINUOUS) "LIVE — listening…" else "Listening…"
+                    VoicePhase.LISTENING -> when {
+                        mic == MicState.LISTENING_WAKE && state.followUp.value ->
+                            "Follow-up — just speak"
+                        mic == MicState.LISTENING_WAKE -> "Say \"Cosmos …\""
+                        else -> "Listening…"
+                    }
                     VoicePhase.THINKING -> "Thinking…"
                     VoicePhase.SPEAKING -> "Speaking…"
-                    VoicePhase.IDLE -> "Tap to talk"
+                    VoicePhase.IDLE ->
+                        if (state.masterOn.value) "Tap to talk" else "MIC OFF"
                 },
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Bold,

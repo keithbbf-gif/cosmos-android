@@ -37,10 +37,16 @@ Native Android voice client for the COSMOS `/api/v1` API.
    Leave the bearer token blank while the server runs `--no-auth`.
 2. Tap **Connect / Test** — it GETs `/api/v1/status` and shows `ready` /
    `tree_id`.
-3. Tap the big **MIC** button. On the very first tap the app downloads the
-   VOSK model (see below) — a one-time ~40 MB download with a progress bar.
-   Then grant the microphone permission when asked.
-4. Speak. Pause → the finalized transcript is POSTed to `/api/v1/voice`.
+3. Tap the big **MIC ON** toggle. On the very first turn-on the app downloads
+   the VOSK model (see below) — a one-time ~40 MB download with a progress
+   bar. Then grant the microphone permission when asked.
+4. **Default is hands-free wake-word listening (WAKE mode):** say
+   **"Cosmos, status"** (or "hey cosmos ..."). The wake word is stripped and
+   the rest is POSTed to `/api/v1/voice`. Utterances WITHOUT the wake word
+   are decoded on the phone and dropped — never sent. After a reply, a ~10 s
+   follow-up window accepts one utterance without the wake word.
+   TAP (tap-to-talk) and HOLD (push-to-talk) are optional modes in the
+   selector under the toggle.
    The reply's `spoken` text is read aloud and logged in the console.
    The `session_id` from the reply is carried forward automatically —
    the sid is the conversation.
