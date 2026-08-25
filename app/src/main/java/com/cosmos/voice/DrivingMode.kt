@@ -55,6 +55,21 @@ object VoiceGrammar {
     fun isDictateStart(norm: String): Boolean = stripWake(normalize(norm)) in DICTATE_START
     fun isDictateDone(norm: String): Boolean = stripWake(normalize(norm)) in DICTATE_DONE
 
+    /** "say again" / "repeat" / "repeat that" — re-speak the last reply. */
+    private val SAY_AGAIN = setOf("say again", "repeat", "repeat that")
+
+    fun isSayAgain(norm: String): Boolean = stripWake(normalize(norm)) in SAY_AGAIN
+
+    /** A spoken authoritative STOP: "stop" / "stop listening". Only consulted
+     *  when NO confirm is pending (a pending confirm consumes "stop" as a
+     *  cancel answer first — that path runs earlier). */
+    fun isStop(norm: String): Boolean =
+        stripWake(normalize(norm)) in setOf("stop", "stop listening")
+
+    /** "new session" — drop the session id, start a fresh conversation. */
+    fun isNewSession(norm: String): Boolean =
+        stripWake(normalize(norm)) == "new session"
+
     /**
      * VOSK command-mode grammar: a JSON array of every phrase the recognizer
      * is ALLOWED to emit, plus "[unk]" (anything else surfaces as [unk]
@@ -75,6 +90,8 @@ object VoiceGrammar {
         )
         phrases += DICTATE_START
         phrases += DICTATE_DONE
+        phrases += SAY_AGAIN
+        phrases += setOf("stop listening", "boot up")
         phrases += "cosmos"
         phrases += "[unk]"
         return JSONArray(phrases.toList()).toString()
@@ -270,12 +287,27 @@ class OfflineQueue(private val prefs: SharedPreferences) {
         }
     }
 
+    /** Empty the queue NOW (authoritative STOP / remote clear_queue). Returns
+     *  the number of items discarded so the caller can log it. */
+    fun clear(): Int {
+        synchronized(items) {
+            val n = items.size
+            if (n > 0) {
+                items.clear()
+                persist()
+            }
+            return n
+        }
+    }
+
     private fun persist() {
         prefs.edit().putString(KEY, JSONArray(items).toString()).apply()
     }
 
     companion object {
-        const val MAX_ITEMS = 100
+        /** Small on purpose: voice is ephemeral. 5 items max — past the cap
+         *  the oldest is dropped (bounded, reported loss). */
+        const val MAX_ITEMS = 5
         /** Voice goes stale fast: anything older than this never replays. */
         const val MAX_AGE_MS = 120_000L
         private const val KEY = "offline_queue"

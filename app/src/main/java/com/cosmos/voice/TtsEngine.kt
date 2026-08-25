@@ -55,6 +55,11 @@ class TtsEngine(
     var isReady = false
         private set
 
+    /** Speech rate multiplier (1.0 = normal). Driven by the UI slider; applied
+     *  per utterance at synthesis time, so the change takes effect on the very
+     *  next thing spoken. */
+    @Volatile var speed: Float = 1.0f
+
     // Bumped by every flush/stop. An utterance whose gen no longer matches is
     // stale: skipped if still queued, aborted mid-synthesis, and its onDone is
     // suppressed (the interrupter already owns the speaking flags).
@@ -188,7 +193,7 @@ class TtsEngine(
             // sherpa-onnx streams synthesized chunks into the callback;
             // samples are floats in [-1, 1] at the model's sample rate.
             // Return 1 to continue synthesis, 0 to abort (barge-in).
-            engine.generateWithCallback(text = utt.text) { samples ->
+            engine.generateWithCallback(text = utt.text, speed = speed) { samples ->
                 if (utt.gen != generation) {
                     0
                 } else {
