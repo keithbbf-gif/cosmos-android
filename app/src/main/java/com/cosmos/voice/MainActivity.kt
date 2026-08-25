@@ -187,6 +187,10 @@ class AppState {
     // Gates only WHICH utterances are sent — never whether the mic can be
     // stopped: master OFF / STOP / remote control are untouched. Persisted.
     val requireWake = mutableStateOf(true)
+    // How tolerant the wake match is: STRICT = exact "cosmos" only; NORMAL
+    // (default) also accepts close Vosk mishearings ("cosmo", "cosmic", ...).
+    // Tighten to STRICT if road chatter false-triggers. Persisted.
+    val wakeSensitivity = mutableStateOf(WakeSensitivity.NORMAL)
 }
 
 /** The one visual phase the mic button + big label reflect. Priority when
@@ -338,6 +342,17 @@ class MainActivity : ComponentActivity() {
         // Trigger-word requirement (WAKE mode). Default TRUE — open listening
         // is always an explicit opt-in, never how the app comes up unasked.
         state.requireWake.value = prefs.getBoolean("require_wake", true)
+        // Wake sensitivity (fuzzy wake match). Default NORMAL; STRICT is the
+        // opt-in tightening for when road chatter false-triggers.
+        state.wakeSensitivity.value = try {
+            WakeSensitivity.valueOf(
+                prefs.getString("wake_sensitivity", WakeSensitivity.NORMAL.name)
+                    ?: WakeSensitivity.NORMAL.name
+            )
+        } catch (e: Exception) {
+            WakeSensitivity.NORMAL
+        }
+        VoiceGrammar.wakeSensitivity = state.wakeSensitivity.value
 
         state.stream.value = prefs.getString("stream", "plumbing") ?: "plumbing"
         state.verbosity.value = prefs.getString("verbosity", "normal") ?: "normal"
@@ -405,6 +420,7 @@ class MainActivity : ComponentActivity() {
                     onDictate = { setDictateMode(!state.dictateMode.value) },
                     onPhoneMic = { on -> setPhoneMic(on) },
                     onRequireWake = { on -> setRequireWake(on) },
+                    onWakeSensitivity = { s -> setWakeSensitivity(s) },
                     onOfflineQueue = { on -> setOfflineQueue(on) },
                     onStream = { s -> setStream(s) },
                     onBootUp = { bootUp() },
@@ -1032,6 +1048,28 @@ class MainActivity : ComponentActivity() {
                 "you say (minus noise) is SENT to COSMOS. STOP always wins.")
         if (handsFree) cue(if (on) "Trigger word required." else "Open listening.")
         updateMicService() // notification label names the active sub-mode
+    }
+
+    /** Wake sensitivity (WAKE mode) — persisted, default NORMAL. STRICT =
+     *  exact "cosmos" only; NORMAL also accepts the close variants the small
+     *  Vosk model emits in road noise. Pure gating change: it only alters
+     *  which first tokens count as the wake word — every stop/safety path is
+     *  untouched, and no recognizer rebuild is needed (the variants are
+     *  always in the grammar; acceptance is decided per-final). */
+    private fun setWakeSensitivity(s: WakeSensitivity) {
+        if (state.wakeSensitivity.value == s) return
+        state.wakeSensitivity.value = s
+        VoiceGrammar.wakeSensitivity = s
+        getSharedPreferences("cosmos", Context.MODE_PRIVATE).edit()
+            .putString("wake_sensitivity", s.name)
+            .apply()
+        log(when (s) {
+            WakeSensitivity.STRICT ->
+                "WAKE SENSITIVITY: STRICT — only an exact \"Cosmos\" triggers."
+            WakeSensitivity.NORMAL ->
+                "WAKE SENSITIVITY: NORMAL — close mishearings of \"Cosmos\" " +
+                    "(cosmo, cosmic, ...) also trigger."
+        })
     }
 
     /** Haptics on/off toggle — persisted, default ON. */
@@ -2019,11 +2057,15 @@ class MainActivity : ComponentActivity() {
         const val T2T_MAX_WAIT_MS = 8_000L
 
         /** WAKE mode: follow-up window after a spoken reply — ONE utterance
-         *  is accepted without the wake word, then gating resumes. */
+         *  is accepted without the wake word, then gating resumes.
+         *  ROAD-TUNABLE: lengthen if replies land while the driver is mid-
+         *  maneuver and answers keep missing the window; shorten if ambient
+         *  chatter keeps slipping in as the "follow-up". */
         const val FOLLOW_UP_MS = 10_000L
 
         /** WAKE mode: command window after a bare "cosmos" (wake heard, no
-         *  command yet) — the next utterance is the command. */
+         *  command yet) — the next utterance is the command.
+         *  ROAD-TUNABLE: same trade-off as FOLLOW_UP_MS. */
         const val COMMAND_WINDOW_MS = 8_000L
     }
 }
@@ -2049,6 +2091,7 @@ fun AppScreen(
     onDictate: () -> Unit,
     onPhoneMic: (Boolean) -> Unit,
     onRequireWake: (Boolean) -> Unit,
+    onWakeSensitivity: (WakeSensitivity) -> Unit,
     onOfflineQueue: (Boolean) -> Unit,
     onStream: (String) -> Unit,
     onBootUp: () -> Unit,
@@ -2261,6 +2304,30 @@ fun AppScreen(
                         checked = state.requireWake.value,
                         onCheckedChange = onRequireWake
                     )
+                }
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(text = "Wake sensitivity")
+                        Text(
+                            text = "NORMAL also hears close mishearings of " +
+                                "\"Cosmos\"; STRICT = exact word only",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    WakeSensitivity.values().forEach { s ->
+                        val sel = state.wakeSensitivity.value == s
+                        TextButton(onClick = { onWakeSensitivity(s) }) {
+                            Text(
+                                text = s.name,
+                                fontWeight = if (sel) FontWeight.Bold else FontWeight.Normal,
+                                color = if (sel) Color(0xFF2E7D32)
+                                    else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
                 }
                 Row(
                     verticalAlignment = Alignment.CenterVertically,

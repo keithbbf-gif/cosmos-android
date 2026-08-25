@@ -11,8 +11,8 @@ android {
         applicationId = "com.cosmos.voice"
         minSdk = 26
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
     }
 
     buildTypes {
@@ -74,4 +74,7 @@ dependencies {
 
     // tar.bz2 extraction for the Piper voice archive (pure Java, no natives).
     implementation("org.apache.commons:commons-compress:1.27.1")
+
+    // Unit tests (JVM): VoiceGrammar wake-word fuzzy matching.
+    testImplementation("junit:junit:4.13.2")
 }

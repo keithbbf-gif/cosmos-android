@@ -6,6 +6,17 @@ import org.json.JSONObject
 import java.util.Locale
 
 /**
+ * How tolerant the wake-word match is (WAKE mode).
+ *  STRICT — exact "cosmos" / "hey cosmos" only. For when road chatter
+ *           false-triggers on the fuzzy variants.
+ *  NORMAL — (default) also accepts the close variants the small Vosk model
+ *           commonly emits for "cosmos" in road noise ("cosmo", "cosmic",
+ *           "kosmos", ...) plus anything within one edit of "cosmos".
+ * Persisted in MainActivity; the live level is VoiceGrammar.wakeSensitivity.
+ */
+enum class WakeSensitivity { STRICT, NORMAL }
+
+/**
  * Small, dumb, testable voice grammar for eyes-free driving.
  *
  * The SERVER classifies commands — this object only decides what the PHONE
@@ -14,6 +25,12 @@ import java.util.Locale
  * it comes from the server's `kind` classification (see handleReply).
  */
 object VoiceGrammar {
+
+    /** Live wake-match level. Written by MainActivity (persisted setting);
+     *  every hasWake/stripWake call defaults to it. The pure functions also
+     *  take the level as a parameter so unit tests never depend on it. */
+    @Volatile
+    var wakeSensitivity: WakeSensitivity = WakeSensitivity.NORMAL
 
     /** First words the COSMOS server treats as verbs. SINGLE SOURCE OF TRUTH
      *  for the command vocabulary: the junk DROP gate, the pre-send cue hint,
@@ -94,6 +111,11 @@ object VoiceGrammar {
         phrases += SAY_AGAIN
         phrases += setOf("stop listening", "boot up")
         phrases += setOf("cosmos", "hey cosmos")
+        // Wake variants ride along so a misheard wake can SURFACE as a close
+        // variant instead of collapsing to [unk] and being dropped. Whether a
+        // variant is then ACCEPTED is decided by isWakeToken per the current
+        // WakeSensitivity — in STRICT mode these emissions are simply ignored.
+        phrases += WAKE_VARIANTS
         phrases += "[unk]"
         return JSONArray(phrases.toList()).toString()
     }
@@ -108,27 +130,92 @@ object VoiceGrammar {
     private fun tokens(norm: String): List<String> =
         if (norm.isBlank()) emptyList() else norm.split(" ")
 
+    // ==================== FUZZY WAKE MATCH ====================
+
+    /** The one true wake word. */
+    private const val WAKE = "cosmos"
+
+    /** Optional address prefix before the wake word ("hey cosmos ..."). */
+    private val WAKE_PREFIXES = setOf("hey", "okay", "ok")
+
     /**
-     * Wake-word address forms: "cosmos ..." / "hey cosmos ..." (plus the
-     * okay/ok variants Vosk tends to hear). In WAKE mode hasWake GATES every
-     * send — an utterance without it is dropped on the phone. In TAP/PTT
-     * capture the address stays optional ("cosmos status" still works).
+     * Close variants the small Vosk model commonly emits for "cosmos" in
+     * road noise. Deliberately short and CLOSED: every entry is a genuine
+     * near-homophone that is NOT a common English word, so accepting it can
+     * never turn ordinary conversation into a trigger. ("cost", "because",
+     * "customer", "cosmetic" are all kept OUT — see the tests.)
      */
-    fun hasWake(norm: String): Boolean {
-        val t = tokens(norm)
-        if (t.isEmpty()) return false
-        if (t[0] == "cosmos") return true
-        return t.size >= 2 && (t[0] == "hey" || t[0] == "okay" || t[0] == "ok") && t[1] == "cosmos"
+    private val WAKE_VARIANTS = setOf(
+        "cosmo",   // final s swallowed by wind noise
+        "cosmos",  // exact (kept here so the set alone is sufficient)
+        "cosmic",  // most frequent small-model substitution
+        "cosms",   // clipped vowel
+        "kosmos"   // k-spelling the model sometimes surfaces
+    )
+
+    /**
+     * Pure, unit-testable: is [word] acceptable as the wake token at [level]?
+     * STRICT: exact "cosmos" only.
+     * NORMAL: the allow-set above, OR within ONE edit of "cosmos" — but only
+     * for words of length 5..7 starting with c/k, so no common English word
+     * ("cost" = 3 edits, "cause" = 4, "customer" fails the length cap) can
+     * sneak in through the distance check.
+     */
+    fun isWakeToken(word: String, level: WakeSensitivity = wakeSensitivity): Boolean {
+        if (word == WAKE) return true
+        if (level == WakeSensitivity.STRICT) return false
+        if (word in WAKE_VARIANTS) return true
+        if (word.length < 5 || word.length > 7) return false
+        if (word[0] != 'c' && word[0] != 'k') return false
+        return editDistance(word, WAKE) <= 1
     }
 
-    /** Remove the wake-word address and return the remainder — "" for a bare
-     *  wake ("cosmos" / "hey cosmos" alone). Unchanged when no wake present. */
-    fun stripWake(norm: String): String {
+    /** Levenshtein edit distance — tiny inputs only (wake-token length). */
+    internal fun editDistance(a: String, b: String): Int {
+        if (a == b) return 0
+        val dp = IntArray(b.length + 1) { it }
+        for (i in 1..a.length) {
+            var prev = dp[0]
+            dp[0] = i
+            for (j in 1..b.length) {
+                val tmp = dp[j]
+                dp[j] = minOf(
+                    dp[j] + 1,      // deletion
+                    dp[j - 1] + 1,  // insertion
+                    prev + if (a[i - 1] == b[j - 1]) 0 else 1 // substitution
+                )
+                prev = tmp
+            }
+        }
+        return dp[b.length]
+    }
+
+    /**
+     * Wake-word address forms: "cosmos ..." / "hey cosmos ..." (plus the
+     * okay/ok variants Vosk tends to hear), where "cosmos" itself may be a
+     * close variant per [level] (fuzzy match, NORMAL default — see
+     * isWakeToken). In WAKE mode hasWake GATES every send — an utterance
+     * without it is dropped on the phone. In TAP/PTT capture the address
+     * stays optional ("cosmos status" still works). The wake token must be
+     * the FIRST word (or second, after hey/ok/okay) — "the cosmos is big"
+     * never triggers.
+     */
+    fun hasWake(norm: String, level: WakeSensitivity = wakeSensitivity): Boolean {
+        val t = tokens(norm)
+        if (t.isEmpty()) return false
+        if (isWakeToken(t[0], level)) return true
+        return t.size >= 2 && t[0] in WAKE_PREFIXES && isWakeToken(t[1], level)
+    }
+
+    /** Remove the wake-word address (fuzzy per [level], like hasWake) and
+     *  return the remainder — "" for a bare wake ("cosmos" / "hey cosmos"
+     *  alone). Unchanged when no wake present. */
+    fun stripWake(norm: String, level: WakeSensitivity = wakeSensitivity): String {
         val t = tokens(norm)
         return when {
-            t.size >= 2 && (t[0] == "hey" || t[0] == "okay" || t[0] == "ok") && t[1] == "cosmos" ->
+            t.size >= 2 && t[0] in WAKE_PREFIXES && isWakeToken(t[1], level) ->
                 t.drop(2).joinToString(" ")
-            t.isNotEmpty() && t[0] == "cosmos" -> t.drop(1).joinToString(" ")
+            t.isNotEmpty() && isWakeToken(t[0], level) -> t.drop(1).joinToString(" ")
             else -> norm
         }
     }

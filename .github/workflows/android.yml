@@ -31,6 +31,9 @@ jobs:
       - name: Generate Gradle wrapper
         run: gradle wrapper --gradle-version 8.7
 
+      - name: Run unit tests (VoiceGrammar wake matching)
+        run: ./gradlew testDebugUnitTest --no-daemon --stacktrace
+
       - name: Build debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
